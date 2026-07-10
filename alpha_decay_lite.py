@@ -57,10 +57,16 @@ class WindowFirst:
 
 # ---------- Process A: Data Factory (Angel SmartWebSocketV2 mode 3) ----------
 def _resolve_nse_tokens(symbols):
-    master = requests.get(SCRIP_URL, timeout=30).json()
+    t0 = time.time()
+    print(f"[A] Downloading scrip master (~4 MB)...", flush=True)
+    master = requests.get(SCRIP_URL, timeout=60).json()
     nse = {r["symbol"].replace("-EQ", ""): r["token"]
            for r in master if r.get("exch_seg") == "NSE" and r.get("symbol", "").endswith("-EQ")}
-    return {nse[s]: s for s in symbols if s in nse}
+    resolved = {nse[s]: s for s in symbols if s in nse}
+    missing = [s for s in symbols if s not in nse]
+    print(f"[A] Scrip master loaded in {time.time()-t0:.1f}s, resolved {len(resolved)}/{len(symbols)} symbols", flush=True)
+    if missing: print(f"[A] Symbols NOT found: {missing}", flush=True)
+    return resolved
 
 
 def data_factory():
@@ -79,6 +85,7 @@ def data_factory():
         print(f"[A] FATAL missing env vars: {missing}. Fill .env and restart.")
         return
 
+    print("[A] Logging in to Angel...", flush=True)
     smart = SmartConnect(api_key=api_key)
     sess  = smart.generateSession(client, pwd, pyotp.TOTP(totp_s).now())
     if not sess or not sess.get("data"):
@@ -90,6 +97,7 @@ def data_factory():
         print("       - Ensure system time is NTP-synced: `timedatectl`")
         return
     auth, feed = sess["data"]["jwtToken"], smart.getfeedToken()
+    print(f"[A] Login OK, client={client}", flush=True)
 
     token2sym = _resolve_nse_tokens(UNIVERSE)
     tokens    = list(token2sym.keys())

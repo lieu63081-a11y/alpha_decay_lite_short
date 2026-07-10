@@ -5,15 +5,18 @@ Advisory only.  No order placement.
 """
 import os
 import time
+
+# Force IST for time.localtime() calls (C-level fast path + correct TZ regardless of server).
+os.environ.setdefault("TZ", "Asia/Kolkata")
+if hasattr(time, "tzset"): time.tzset()
+
 import json
 import math
 import asyncio
 import requests
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from multiprocessing import Process
-from zoneinfo import ZoneInfo
 
 import zmq
 import zmq.asyncio
@@ -34,12 +37,10 @@ SPREAD_MAX, EMA_TAU        = 0.0015, 1.0
 RATE_GLOBAL, RATE_SYMBOL   = 20, 5
 CD                         = {"MOMENTUM": 300, "MEAN_REVERSION": 45, "GAP_FADE": 180}
 HWM, LAT_WARN_MS           = 10000, 100
-IST                        = ZoneInfo("Asia/Kolkata")
+MUTE_CACHE_TTL             = 1.0             # seconds; keep small for emergency responsiveness
 
 
 def _clip(x, lo, hi): return max(lo, min(hi, x))
-
-def _ist(ts): return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(IST)
 
 
 # ---------- amortized-O(1) rolling window helpers ----------
@@ -50,14 +51,6 @@ class WindowSum:
         self.q.append((ts, v)); self.s += v
         cut = ts - self.w
         while self.q and self.q[0][0] < cut: self.s -= self.q.popleft()[1]
-
-class WindowFirst:
-    __slots__ = ("w", "q")
-    def __init__(self, window_s): self.w, self.q = window_s, deque()
-    def add(self, ts, v):
-        self.q.append((ts, v))
-        while len(self.q) > 1 and self.q[0][0] < ts - self.w: self.q.popleft()
-    def first(self): return self.q[0][1] if self.q else None
 
 
 # ---------- Process A: Data Factory (Angel SmartWebSocketV2 mode 3) ----------
@@ -107,9 +100,9 @@ def data_factory():
     token2sym = _resolve_nse_tokens(UNIVERSE)
     tokens    = list(token2sym.keys())
 
-    ctx = zmq.Context.instance()
+    ctx = zmq.Context()                              # fresh per-process context, avoids fork-inherited state
     pub = ctx.socket(zmq.PUB); pub.setsockopt(zmq.SNDHWM, HWM); pub.bind(ZMQ_TICKS)
-    print(f"[A] Data Factory up, {len(tokens)} tokens mode=3")
+    print(f"[A] Data Factory up, {len(tokens)} tokens mode=3", flush=True)
 
     ws = SmartWebSocketV2(auth, api_key, client, feed)
 
@@ -142,21 +135,22 @@ def data_factory():
 # ---------- Process B: Alpha Engine ----------
 @dataclass
 class SymbolState:
-    vol_60:  WindowSum   = field(default_factory=lambda: WindowSum(60))
-    vol_20m: WindowSum   = field(default_factory=lambda: WindowSum(1200))
-    vwap_60: WindowFirst = field(default_factory=lambda: WindowFirst(60))
-    ltp_30s: deque       = field(default_factory=deque)    # (ts, ltp) for absorb
-    last_vol:  int   = 0
+    vol_60:  WindowSum = field(default_factory=lambda: WindowSum(60))
+    vol_20m: WindowSum = field(default_factory=lambda: WindowSum(1200))
+    ltp_30s: deque     = field(default_factory=deque)     # (ts, ltp) for absorption
+    last_vol:  int   = -1                                  # -1 = uninitialized (first-tick baseline)
     ema_score: float = 0.0
     last_ts:   float = 0.0
     peak:      float = 0.0
 
 
 # --- 9 calculators, all amortized O(1) per tick ---
-def _c1_vwap_slope(st, tick):
-    first = st.vwap_60.first()
-    if not first: return 0.0
-    return _clip((tick["vwap"] - first) / first * 500, -2.0, 2.0)
+def _c1_vwap_distance(_st, tick):
+    """% distance of LTP from daily VWAP. Daily VWAP is cumulative so its 60s slope
+    is near-zero by afternoon; distance is the meaningful signal (mean-reversion setup)."""
+    if not tick["vwap"] or not tick["ltp"]: return 0.0
+    dist = (tick["ltp"] - tick["vwap"]) / tick["vwap"] * 100
+    return _clip(dist * 5.0, -2.0, 2.0)                   # 0.4% away -> ±2.0 (capped)
 
 def _c2_rvol(st, _tick):
     return st.vol_60.s / max(st.vol_20m.s / 20.0, 1.0)
@@ -165,11 +159,20 @@ def _c3_agg_buy(_st, tick):
     mid = (tick["bid"] + tick["ask"]) / 2 if tick["bid"] and tick["ask"] else tick["ltp"]
     return 1.0 if tick["ltp"] > mid else (-1.0 if tick["ltp"] < mid else 0.0)
 
-def _c4_sell_absorb(st, tick):
-    if len(st.ltp_30s) < 5 or tick["ltp"] == 0: return 0.0
+def _c4_absorption(st, tick):
+    """Symmetric absorption:
+       +1.5 : heavy sell qty + flat LTP -> sellers absorbed (BULLISH)
+       -1.5 : heavy buy  qty + flat LTP -> buyers  absorbed (BEARISH trap)
+        0.0 : neither."""
+    if len(st.ltp_30s) < 5 or not tick["ltp"]: return 0.0
     lo = min(l for _, l in st.ltp_30s); hi = max(l for _, l in st.ltp_30s)
-    pressure = tick["sell_qty"] / max(tick["buy_qty"] + tick["sell_qty"], 1)
-    return 1.5 if ((hi - lo) / tick["ltp"] < 0.001 and pressure > 0.6) else 0.0
+    if (hi - lo) / tick["ltp"] > 0.001: return 0.0        # price not flat enough
+    total = tick["buy_qty"] + tick["sell_qty"]
+    if total < 1: return 0.0
+    sell_ratio = tick["sell_qty"] / total
+    if sell_ratio > 0.6: return  1.5
+    if sell_ratio < 0.4: return -1.5
+    return 0.0
 
 def _c5_imbalance(_st, tick):
     b, a = tick["buy_qty"], tick["sell_qty"]
@@ -179,24 +182,24 @@ def _c6_spread(_st, tick):
     return (tick["ask"] - tick["bid"]) / tick["ltp"] if tick["ltp"] and tick["bid"] and tick["ask"] else 1.0
 
 def _c7_gap(_st, tick):
-    t = _ist(tick["ts"])                                                       # IST always
-    if not (t.hour == 9 and 15 <= t.minute < 30) or not tick["prev_close"]: return 0.0
+    t = time.localtime(tick["ts"])                        # TZ forced to IST at module top
+    if not (t.tm_hour == 9 and 15 <= t.tm_min < 30) or not tick["prev_close"]: return 0.0
     return _clip(-((tick["open"] - tick["prev_close"]) / tick["prev_close"]) * 100, -3.0, 3.0)
 
 def _c8_session_weight(_st, tick):
-    t = _ist(tick["ts"])                                                       # IST always
-    if t.hour == 9 and t.minute < 45: return 1.2                               # OPEN_VOL (9:15-9:45)
-    if t.hour == 15 or (t.hour == 14 and t.minute >= 45): return 1.1           # CLOSE_HOUR (14:45-15:30)
+    t = time.localtime(tick["ts"])
+    if t.tm_hour == 9 and t.tm_min < 45: return 1.2                            # OPEN_VOL (9:15-9:45 IST)
+    if t.tm_hour == 15 or (t.tm_hour == 14 and t.tm_min >= 45): return 1.1     # CLOSE_HOUR (14:45-15:30 IST)
     return 0.8                                                                  # MID_QUIET
 # _c9 -> EMA smoother, applied inline in alpha_engine() loop.
 
 
 def feature_score(st, tick):
     if _c6_spread(st, tick) > SPREAD_MAX: return 0.0, 1.0
-    vwap = _c1_vwap_slope(st, tick)
+    vwap = _c1_vwap_distance(st, tick)
     rvol = _c2_rvol(st, tick)
     agg  = _c3_agg_buy(st, tick)
-    absb = _c4_sell_absorb(st, tick)
+    absb = _c4_absorption(st, tick)
     imb  = _c5_imbalance(st, tick)
     gap  = _c7_gap(st, tick)
     sw   = _c8_session_weight(st, tick)
@@ -205,17 +208,22 @@ def feature_score(st, tick):
 
 
 def _update_windows(st, tick):
-    dvol = max(0, tick["vol"] - st.last_vol); st.last_vol = tick["vol"]
     ts = tick["ts"]
+    # First-tick volume baseline: skip the huge cumulative jump.
+    if st.last_vol < 0:
+        st.last_vol = tick["vol"]
+        dvol = 0
+    else:
+        dvol = max(0, tick["vol"] - st.last_vol)
+        st.last_vol = tick["vol"]
     st.vol_60.add(ts, dvol); st.vol_20m.add(ts, dvol)
-    if tick["vwap"] > 0: st.vwap_60.add(ts, tick["vwap"])
     st.ltp_30s.append((ts, tick["ltp"]))
     cut = ts - 30
     while st.ltp_30s and st.ltp_30s[0][0] < cut: st.ltp_30s.popleft()
 
 
 def alpha_engine():
-    ctx = zmq.Context.instance()
+    ctx = zmq.Context()                              # fresh per-process
     sub = ctx.socket(zmq.SUB)
     sub.setsockopt(zmq.RCVHWM, HWM); sub.setsockopt(zmq.SUBSCRIBE, b""); sub.connect(ZMQ_TICKS)
     pub = ctx.socket(zmq.PUB); pub.setsockopt(zmq.SNDHWM, HWM); pub.bind(ZMQ_SCORES)
@@ -229,11 +237,18 @@ def alpha_engine():
         st = state.setdefault(tick["sym"], SymbolState())
         _update_windows(st, tick)
         raw, rvol = feature_score(st, tick)
-        dt = (tick["ts"] - st.last_ts) if st.last_ts else 0.0
-        alpha = 1.0 - math.exp(-dt / EMA_TAU) if dt > 0 else 1.0                # calc 9
-        st.ema_score = alpha * raw + (1 - alpha) * st.ema_score
+
+        # --- calc 9: EMA smoother ---
+        if st.last_ts == 0:                          # first tick: initialize
+            st.ema_score = raw
+        elif tick["ts"] > st.last_ts:                # normal: advance EMA
+            dt = tick["ts"] - st.last_ts
+            alpha = 1.0 - math.exp(-dt / EMA_TAU)
+            st.ema_score = alpha * raw + (1 - alpha) * st.ema_score
+        # else: same-timestamp batched tick, preserve previous ema_score
         st.last_ts = tick["ts"]
         st.peak    = max(st.peak * 0.995, abs(st.ema_score))
+
         if lat_ms > LAT_WARN_MS: print(f"[B] high lat={lat_ms:.0f}ms sym={tick['sym']}", flush=True)
         pub.send_multipart([sym_b, json.dumps({
             "sym": tick["sym"], "score": st.ema_score, "peak": st.peak,
@@ -253,13 +268,15 @@ def alpha_engine():
 
 # ---------- Process C: Broadcaster (fully async) ----------
 def mode_for(score, rvol):
-    if abs(score) >= 8 and rvol > 2.0:     return "MOMENTUM"
-    if 3 <= abs(score) < 8 and rvol < 1.5: return "MEAN_REVERSION"
+    """Modes:
+       MOMENTUM       : |score| >= 8 and rvol >= 1.5    (relaxed from >2.0 to fill gray band)
+       MEAN_REVERSION : 3 <= |score| < 8 and rvol < 2.0 (widened from <1.5)
+       else           : no signal."""
+    abs_s = abs(score)
+    if abs_s >= 8   and rvol >= 1.5: return "MOMENTUM"
+    if 3 <= abs_s < 8 and rvol < 2.0: return "MEAN_REVERSION"
     return None
 
-
-async def _is_muted(r):
-    return bool(await r.get("alpha:mute")) or os.path.exists(MUTE_FILE)
 
 async def _rate_ok(r, sym):
     hour, day = int(time.time() // 3600), time.strftime("%Y%m%d")
@@ -286,25 +303,32 @@ async def send_telegram(text):
 
 
 async def broadcaster_loop():
-    ctx = zmq.asyncio.Context.instance()
+    ctx = zmq.asyncio.Context()                      # fresh per-process
     sub = ctx.socket(zmq.SUB)
     sub.setsockopt(zmq.RCVHWM, HWM); sub.setsockopt(zmq.SUBSCRIBE, b""); sub.connect(ZMQ_SCORES)
     r = aioredis.from_url(REDIS_URL, decode_responses=True)
     counts = {"scores": 0, "no_mode": 0, "muted": 0, "cooldown": 0, "rate": 0, "sent": 0}
     last_stats = time.time()
+    mute_state = {"muted": False, "ts": 0.0}         # cached mute (1s TTL, avoids hot-loop Redis+disk hit)
     print("[C] Broadcaster up", flush=True)
     while True:
         sym_b, payload = await sub.recv_multipart()
         s = json.loads(payload)
         counts["scores"] += 1
         mode = mode_for(s["score"], s["rvol"])
-        if not mode:                                      counts["no_mode"]  += 1
-        elif await _is_muted(r):                          counts["muted"]    += 1
-        elif not await _cooldown_ok(r, s["sym"], mode):   counts["cooldown"] += 1
-        elif not await _rate_ok(r, s["sym"]):             counts["rate"]     += 1
+        if not mode:
+            counts["no_mode"] += 1
         else:
-            counts["sent"] += 1
-            await send_telegram(build_alert(s, mode))
+            now_wall = time.time()
+            if now_wall - mute_state["ts"] > MUTE_CACHE_TTL:
+                mute_state["muted"] = bool(await r.get("alpha:mute")) or os.path.exists(MUTE_FILE)
+                mute_state["ts"]    = now_wall
+            if mute_state["muted"]:                                counts["muted"]    += 1
+            elif not await _cooldown_ok(r, s["sym"], mode):        counts["cooldown"] += 1
+            elif not await _rate_ok(r, s["sym"]):                  counts["rate"]     += 1
+            else:
+                counts["sent"] += 1
+                await send_telegram(build_alert(s, mode))
         now = time.time()
         if now - last_stats >= 15:
             print(f"[C] {counts}", flush=True)

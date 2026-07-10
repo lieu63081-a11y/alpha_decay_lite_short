@@ -34,15 +34,15 @@ Per-tick end-to-end latency: **~1 ms** tick-to-score-published, ~200 ms tick-to-
 
 | # | Function | Role |
 |---|----------|------|
-| 1 | `_c1_vwap_slope`     | Rolling VWAP slope over 60s (via `WindowFirst`) |
+| 1 | `_c1_vwap_distance`  | % distance of LTP from daily VWAP (mean-reversion setup) |
 | 2 | `_c2_rvol`           | 60s volume vs 20-min per-minute average (via two `WindowSum`) |
 | 3 | `_c3_agg_buy`        | Lee-Ready: LTP vs (bid+ask)/2 → +1 / 0 / -1 |
-| 4 | `_c4_sell_absorb`    | Heavy sell qty + flat LTP over 30s → absorption bullish |
+| 4 | `_c4_absorption`     | **Symmetric**: sell-absorb (+1.5 bullish) / buy-absorb (-1.5 bearish trap) |
 | 5 | `_c5_imbalance`      | L1 book (buy_qty − sell_qty)/(buy_qty + sell_qty) × 2 |
 | 6 | `_c6_spread`         | Spread filter (> 0.15% → score gated to 0) |
-| 7 | `_c7_gap`            | Gap fade in 9:15–9:30 window (planned mode trigger) |
+| 7 | `_c7_gap`            | Gap fade in 9:15–9:30 IST window (planned mode trigger) |
 | 8 | `_c8_session_weight` | OPEN_VOL 1.2 · MID_QUIET 0.8 · CLOSE_HOUR 1.1 |
-| 9 | EMA smoother         | `alpha = 1 − exp(-dt / tau)`, `tau = 1.0s` (inline in engine loop) |
+| 9 | EMA smoother         | `alpha = 1 − exp(-dt / tau)`, `tau = 1.0s`; first-tick init separated, dt=0 preserves prev score |
 
 **Aggregator:**
 ```
@@ -57,9 +57,11 @@ score  = clip(raw, -10, +10)  →  EMA smoother
 
 | Mode | Trigger | Cooldown | SL suggestion |
 |------|---------|----------|---------------|
-| `MOMENTUM`       | `|score| ≥ 8` and `rvol > 2.0` | 300 s | 1.5% |
-| `MEAN_REVERSION` | `3 ≤ |score| < 8` and `rvol < 1.5` | 45 s | 0.5% |
-| `GAP_FADE`       | 9:15–9:30, `|gap| > 1%` *(planned)* | 180 s | gap-based |
+| `MOMENTUM`       | `|score| ≥ 8` and `rvol ≥ 1.5` | 300 s | 1.5% |
+| `MEAN_REVERSION` | `3 ≤ |score| < 8` and `rvol < 2.0` | 45 s | 0.5% |
+| `GAP_FADE`       | 9:15–9:30 IST, `|gap| > 1%` *(planned)* | 180 s | gap-based |
+
+Gray-area handling: score ≥ 8 with rvol < 1.5 (suspicious high-score without volume confirmation) currently returns no signal — consider it a future `FAKE_BREAKOUT` mode.
 
 ---
 

@@ -40,6 +40,12 @@ SCRIP_URL   = "https://margincalculator.angelbroking.com/OpenAPI_File/files/Open
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+# Angel SDK mode-3 SNAP_QUOTE has been reported to swap best_5_buy_data
+# and best_5_sell_data at the output layer. Set ANGEL_BIDASK_SWAPPED=1 in
+# .env ONLY after running diag_bidask.py confirms the swap on your SDK version.
+# Wrong toggle would ACTUALLY break the spread filter.
+ANGEL_BIDASK_SWAPPED = os.getenv("ANGEL_BIDASK_SWAPPED", "0").strip() == "1"
+
 SPREAD_MAX, EMA_TAU        = 0.0015, 1.0
 RATE_GLOBAL, RATE_SYMBOL   = 20, 5
 CD                         = {"MOMENTUM": 300, "MEAN_REVERSION": 45, "GAP_FADE": 180}
@@ -152,6 +158,7 @@ def data_factory():
 
     ctx = zmq.Context()
     pub = ctx.socket(zmq.PUB); pub.setsockopt(zmq.SNDHWM, HWM); pub.bind(ZMQ_TICKS)
+    time.sleep(1.5)                                    # let SUB peers connect (ZMQ slow-joiner mitigation)
     print(f"[A] Data Factory up, {len(tokens)} tokens mode=3", flush=True)
 
     # Heartbeats: kill switch #1 (data flow) + process-alive.
@@ -160,13 +167,24 @@ def data_factory():
     def _data_check(): return ("data", (time.time() - last_tick["ts"]) < DATA_HB_TTL_S)
     _start_hb_thread("A", r_sync, extra_check=_data_check)
 
-    ws = SmartWebSocketV2(auth, api_key, client, feed)
+    # SDK default max_retry_attempt=1 -> only 1 reconnect attempt, then dies.
+    # Bump to survive transient network hiccups. Fall back to defaults if
+    # the installed SDK version does not accept these kwargs.
+    try:
+        ws = SmartWebSocketV2(auth, api_key, client, feed,
+                              max_retry_attempt=10, retry_strategy=1,
+                              retry_delay=5, retry_multiplier=2, retry_duration=60)
+    except TypeError:
+        print("[A] SDK does not accept retry kwargs, using defaults", flush=True)
+        ws = SmartWebSocketV2(auth, api_key, client, feed)
 
     def on_data(_ws, m):
         sym = token2sym.get(str(m.get("token")))
         if not sym: return
         last_tick["ts"] = time.time()
         b5, s5 = m.get("best_5_buy_data") or [], m.get("best_5_sell_data") or []
+        # If SDK is swapping labels (verified via diag_bidask.py), exchange them here.
+        if ANGEL_BIDASK_SWAPPED: b5, s5 = s5, b5
         tick = {
             "sym": sym, "ts": time.time(),
             "ltp":  m.get("last_traded_price", 0) / 100.0,
@@ -259,8 +277,9 @@ def _c8_session_weight(_st, tick):
 
 
 def feature_score(st, tick):
+    """Returns (composite_score in [-10,+10], rvol, gap_raw)."""
     rvol = _c2_rvol(st, tick)
-    if _c6_spread(st, tick) > SPREAD_MAX: return 0.0, rvol
+    if _c6_spread(st, tick) > SPREAD_MAX: return 0.0, rvol, 0.0
     vwap = _c1_vwap_distance(st, tick)
     agg  = _c3_agg_buy(st, tick)
     absb = _c4_absorption(st, tick)
@@ -268,7 +287,8 @@ def feature_score(st, tick):
     gap  = _c7_gap(st, tick)
     sw   = _c8_session_weight(st, tick)
     hidden = (max(agg, absb) + 0.4 * min(agg, absb)) if agg * absb >= 0 else (agg + absb)
-    return _clip(sw * (2.0 * vwap + 1.5 * hidden + 1.5 * imb + 1.0 * gap), -10.0, 10.0), rvol
+    composite = _clip(sw * (2.0 * vwap + 1.5 * hidden + 1.5 * imb + 1.0 * gap), -10.0, 10.0)
+    return composite, rvol, gap
 
 
 def _classify(tick, last_ltp):
@@ -319,7 +339,7 @@ def alpha_engine():
         st = state.get(sym)
         if st is None: st = state[sym] = SymbolState()
         _update_windows(st, tick)
-        raw, rvol = feature_score(st, tick)
+        raw, rvol, gap_raw = feature_score(st, tick)
 
         if st.last_ts == 0:
             st.ema_score = raw; st.peak = abs(raw)
@@ -334,7 +354,7 @@ def alpha_engine():
         if lat_ms > LAT_WARN_MS: print(f"[B] high lat={lat_ms:.0f}ms sym={sym}", flush=True)
         pub.send_multipart([sym_b, json.dumps({
             "sym": sym, "score": st.ema_score, "peak": st.peak,
-            "rvol": rvol, "ltp": tick["ltp"], "ts": tick["ts"],
+            "rvol": rvol, "gap": gap_raw, "ltp": tick["ltp"], "ts": tick["ts"],
         }).encode()])
         tick_count += 1
         now = time.time()
@@ -349,7 +369,13 @@ def alpha_engine():
 
 
 # ---------- Process C: Broadcaster + Telegram bot ----------
-def mode_for(score, rvol):
+def mode_for(score, rvol, gap=0.0):
+    """Modes (priority order):
+       GAP_FADE       : |gap_raw| >= 2.0  (only fires 9:15-9:30 IST via _c7_gap gating)
+       MOMENTUM       : |score| >= 8 and rvol >= 1.5
+       MEAN_REVERSION : 3 <= |score| < 8 and rvol < 2.0
+    Gap direction is already sign-inverted in _c7_gap: positive gap value -> LONG (fade down-gap)."""
+    if abs(gap) >= 2.0: return "GAP_FADE"
     abs_s = abs(score)
     if abs_s >= 8   and rvol >= 1.5: return "MOMENTUM"
     if 3 <= abs_s < 8 and rvol < 2.0: return "MEAN_REVERSION"
@@ -372,10 +398,15 @@ async def _exit_cooldown_ok(r, sym):
 
 
 def _entry_alert_text(s, mode):
-    side = "LONG" if s["score"] > 0 else "SHORT"
+    # For GAP_FADE the meaningful direction is gap sign, not composite score sign.
+    if mode == "GAP_FADE":
+        side = "LONG" if s.get("gap", 0.0) > 0 else "SHORT"
+    else:
+        side = "LONG" if s["score"] > 0 else "SHORT"
     sl = {"MOMENTUM": "1.5%", "MEAN_REVERSION": "0.5%", "GAP_FADE": "gap-based"}[mode]
+    extra = f"  gap={s['gap']:+.2f}" if mode == "GAP_FADE" and "gap" in s else ""
     return (f"🔔 [{mode}] {s['sym']} {side}\n"
-            f"score={s['score']:+.2f}  peak={s['peak']:.2f}  ltp={s['ltp']:.2f}\n"
+            f"score={s['score']:+.2f}  peak={s['peak']:.2f}  ltp={s['ltp']:.2f}{extra}\n"
             f"suggested SL: {sl}\nadvisory only — user executes manually")
 
 
@@ -521,6 +552,9 @@ async def broadcaster_loop():
     sub.setsockopt(zmq.RCVHWM, HWM); sub.setsockopt(zmq.SUBSCRIBE, b""); sub.connect(ZMQ_SCORES)
     r = aioredis.from_url(REDIS_URL, decode_responses=True,
                           health_check_interval=30, socket_keepalive=True)
+    # Process C liveness heartbeat (symmetric with A and B).
+    r_sync = redis.from_url(REDIS_URL, decode_responses=True)
+    _start_hb_thread("C", r_sync)
     await _tg_init(r)
     counts = {"scores": 0, "no_mode": 0, "muted": 0, "no_data": 0, "engine_dead": 0,
               "cooldown": 0, "rate": 0, "sent": 0, "exit_sent": 0, "redis_err": 0}
@@ -557,8 +591,8 @@ async def broadcaster_loop():
                             counts["redis_err"] += 1
                             print(f"[C] exit err: {e!r}", flush=True)
 
-                    # 2) Entry alerts
-                    mode = mode_for(s["score"], s["rvol"])
+                    # 2) Entry alerts (GAP_FADE / MOMENTUM / MEAN_REVERSION)
+                    mode = mode_for(s["score"], s["rvol"], s.get("gap", 0.0))
                     if not mode:
                         counts["no_mode"] += 1
                     else:

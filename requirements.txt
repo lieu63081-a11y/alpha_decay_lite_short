@@ -1,0 +1,8 @@
+pyzmq>=25.0
+redis>=5.0
+python-dotenv>=1.0
+python-telegram-bot>=21.0
+smartapi-python>=1.5
+pyotp>=2.9
+requests>=2.31
+psycopg[binary]>=3.2

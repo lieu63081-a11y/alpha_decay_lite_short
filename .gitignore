@@ -1,0 +1,35 @@
+# --- secrets ---
+.env
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# --- runtime / logs ---
+*.log
+/tmp/
+alpha_ticks.ipc
+alpha_scores.ipc
+alpha_mute.flag
+dump.rdb
+appendonly.aof
+appendonlydir/
+
+# --- OS ---
+Thumbs.db

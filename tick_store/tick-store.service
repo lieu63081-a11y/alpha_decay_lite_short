@@ -1,0 +1,24 @@
+[Unit]
+Description=Tick Store (broker WebSocket capture + REST API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/tick_store
+EnvironmentFile=/home/ubuntu/tick_store/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/tick_store/.venv/bin/python tick_store.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/tick-store.log
+StandardError=append:/var/log/tick-store.log
+# Basic hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/tick_store /var/log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+fastapi>=0.104
+uvicorn>=0.24
+python-dotenv>=1.0
+requests>=2.31
+
+# For BROKER=angel:
+smartapi-python>=1.5
+pyotp>=2.9
+logzero>=1.7
+websocket-client>=1.6
+
+# For BROKER=upstox (uncomment when using):
+# upstox-python-sdk>=2.0

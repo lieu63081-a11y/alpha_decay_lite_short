@@ -238,8 +238,9 @@ def alpha_engine():
         now = time.time()
         if now - last_stats >= 10:
             top = sorted(state.items(), key=lambda kv: -abs(kv[1].ema_score))[:5]
-            summary = "  ".join(f"{s}={st.ema_score:+.2f}(ltp={st.last_vol and int(st.last_vol) or '-'})"
-                                for s, st in top) or "-"
+            def _last_ltp(s): return s.ltp_30s[-1][1] if s.ltp_30s else 0.0
+            summary = "  ".join(f"{sym}={sst.ema_score:+.2f}(ltp={_last_ltp(sst):.1f})"
+                                for sym, sst in top) or "-"
             rate = tick_count / max(now - last_stats, 0.001)
             print(f"[B] ticks={tick_count} ({rate:.0f}/s)  syms={len(state)}  top: {summary}", flush=True)
             tick_count, last_stats = 0, now

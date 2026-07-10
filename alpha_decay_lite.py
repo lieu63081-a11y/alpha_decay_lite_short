@@ -11,7 +11,9 @@ import asyncio
 import requests
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from multiprocessing import Process
+from zoneinfo import ZoneInfo
 
 import zmq
 import zmq.asyncio
@@ -32,9 +34,12 @@ SPREAD_MAX, EMA_TAU        = 0.0015, 1.0
 RATE_GLOBAL, RATE_SYMBOL   = 20, 5
 CD                         = {"MOMENTUM": 300, "MEAN_REVERSION": 45, "GAP_FADE": 180}
 HWM, LAT_WARN_MS           = 10000, 100
+IST                        = ZoneInfo("Asia/Kolkata")
 
 
 def _clip(x, lo, hi): return max(lo, min(hi, x))
+
+def _ist(ts): return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(IST)
 
 
 # ---------- amortized-O(1) rolling window helpers ----------
@@ -174,14 +179,14 @@ def _c6_spread(_st, tick):
     return (tick["ask"] - tick["bid"]) / tick["ltp"] if tick["ltp"] and tick["bid"] and tick["ask"] else 1.0
 
 def _c7_gap(_st, tick):
-    t = time.localtime(tick["ts"])
-    if not (t.tm_hour == 9 and 15 <= t.tm_min < 30) or not tick["prev_close"]: return 0.0
+    t = _ist(tick["ts"])                                                       # IST always
+    if not (t.hour == 9 and 15 <= t.minute < 30) or not tick["prev_close"]: return 0.0
     return _clip(-((tick["open"] - tick["prev_close"]) / tick["prev_close"]) * 100, -3.0, 3.0)
 
 def _c8_session_weight(_st, tick):
-    t = time.localtime(tick["ts"])
-    if t.tm_hour == 9 and t.tm_min < 45: return 1.2                            # OPEN_VOL
-    if t.tm_hour >= 15 or (t.tm_hour == 14 and t.tm_min >= 45): return 1.1     # CLOSE_HOUR
+    t = _ist(tick["ts"])                                                       # IST always
+    if t.hour == 9 and t.minute < 45: return 1.2                               # OPEN_VOL (9:15-9:45)
+    if t.hour == 15 or (t.hour == 14 and t.minute >= 45): return 1.1           # CLOSE_HOUR (14:45-15:30)
     return 0.8                                                                  # MID_QUIET
 # _c9 -> EMA smoother, applied inline in alpha_engine() loop.
 

@@ -68,10 +68,27 @@ def data_factory():
     from SmartApi.smartWebSocketV2 import SmartWebSocketV2
     import pyotp
 
-    api_key, client = os.getenv("ANGEL_API_KEY"), os.getenv("ANGEL_CLIENT_CODE")
-    pwd, totp = os.getenv("ANGEL_PASSWORD"), os.getenv("ANGEL_TOTP_SECRET")
+    api_key = os.getenv("ANGEL_API_KEY")
+    client  = os.getenv("ANGEL_CLIENT_CODE")
+    pwd     = os.getenv("ANGEL_PASSWORD")           # 4-digit MPIN, not web password
+    totp_s  = os.getenv("ANGEL_TOTP_SECRET")
+
+    missing = [k for k, v in {"ANGEL_API_KEY": api_key, "ANGEL_CLIENT_CODE": client,
+                              "ANGEL_PASSWORD": pwd, "ANGEL_TOTP_SECRET": totp_s}.items() if not v]
+    if missing:
+        print(f"[A] FATAL missing env vars: {missing}. Fill .env and restart.")
+        return
+
     smart = SmartConnect(api_key=api_key)
-    sess  = smart.generateSession(client, pwd, pyotp.TOTP(totp).now())
+    sess  = smart.generateSession(client, pwd, pyotp.TOTP(totp_s).now())
+    if not sess or not sess.get("data"):
+        msg = (sess or {}).get("message", "unknown")
+        print(f"[A] FATAL Angel login failed: {msg}")
+        print("     Common fixes:")
+        print("       - ANGEL_PASSWORD must be your 4-digit MPIN (not web login password)")
+        print("       - ANGEL_TOTP_SECRET must be the full base32 secret (not 6-digit code)")
+        print("       - Ensure system time is NTP-synced: `timedatectl`")
+        return
     auth, feed = sess["data"]["jwtToken"], smart.getfeedToken()
 
     token2sym = _resolve_nse_tokens(UNIVERSE)

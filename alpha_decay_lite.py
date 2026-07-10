@@ -215,7 +215,8 @@ def alpha_engine():
     sub.setsockopt(zmq.RCVHWM, HWM); sub.setsockopt(zmq.SUBSCRIBE, b""); sub.connect(ZMQ_TICKS)
     pub = ctx.socket(zmq.PUB); pub.setsockopt(zmq.SNDHWM, HWM); pub.bind(ZMQ_SCORES)
     state: dict[str, SymbolState] = {}
-    print("[B] Alpha Engine up")
+    tick_count, last_stats = 0, time.time()
+    print("[B] Alpha Engine up", flush=True)
     while True:
         sym_b, payload = sub.recv_multipart()
         tick = json.loads(payload)
@@ -228,11 +229,20 @@ def alpha_engine():
         st.ema_score = alpha * raw + (1 - alpha) * st.ema_score
         st.last_ts = tick["ts"]
         st.peak    = max(st.peak * 0.995, abs(st.ema_score))
-        if lat_ms > LAT_WARN_MS: print(f"[B] high lat={lat_ms:.0f}ms sym={tick['sym']}")
+        if lat_ms > LAT_WARN_MS: print(f"[B] high lat={lat_ms:.0f}ms sym={tick['sym']}", flush=True)
         pub.send_multipart([sym_b, json.dumps({
             "sym": tick["sym"], "score": st.ema_score, "peak": st.peak,
             "rvol": rvol, "ltp": tick["ltp"], "ts": tick["ts"],
         }).encode()])
+        tick_count += 1
+        now = time.time()
+        if now - last_stats >= 10:
+            top = sorted(state.items(), key=lambda kv: -abs(kv[1].ema_score))[:5]
+            summary = "  ".join(f"{s}={st.ema_score:+.2f}(ltp={st.last_vol and int(st.last_vol) or '-'})"
+                                for s, st in top) or "-"
+            rate = tick_count / max(now - last_stats, 0.001)
+            print(f"[B] ticks={tick_count} ({rate:.0f}/s)  syms={len(state)}  top: {summary}", flush=True)
+            tick_count, last_stats = 0, now
 
 
 # ---------- Process C: Broadcaster (fully async) ----------
@@ -274,16 +284,25 @@ async def broadcaster_loop():
     sub = ctx.socket(zmq.SUB)
     sub.setsockopt(zmq.RCVHWM, HWM); sub.setsockopt(zmq.SUBSCRIBE, b""); sub.connect(ZMQ_SCORES)
     r = aioredis.from_url(REDIS_URL, decode_responses=True)
-    print("[C] Broadcaster up")
+    counts = {"scores": 0, "no_mode": 0, "muted": 0, "cooldown": 0, "rate": 0, "sent": 0}
+    last_stats = time.time()
+    print("[C] Broadcaster up", flush=True)
     while True:
         sym_b, payload = await sub.recv_multipart()
         s = json.loads(payload)
+        counts["scores"] += 1
         mode = mode_for(s["score"], s["rvol"])
-        if not mode: continue
-        if await _is_muted(r): continue
-        if not await _cooldown_ok(r, s["sym"], mode): continue
-        if not await _rate_ok(r, s["sym"]): continue
-        await send_telegram(build_alert(s, mode))
+        if not mode:                                      counts["no_mode"]  += 1
+        elif await _is_muted(r):                          counts["muted"]    += 1
+        elif not await _cooldown_ok(r, s["sym"], mode):   counts["cooldown"] += 1
+        elif not await _rate_ok(r, s["sym"]):             counts["rate"]     += 1
+        else:
+            counts["sent"] += 1
+            await send_telegram(build_alert(s, mode))
+        now = time.time()
+        if now - last_stats >= 15:
+            print(f"[C] {counts}", flush=True)
+            counts = dict.fromkeys(counts, 0); last_stats = now
 
 
 def run_broadcaster(): asyncio.run(broadcaster_loop())

@@ -20,7 +20,7 @@ Angel WS (mode 3)  →  Process A  ─ZMQ ticks─→   Process B  ─ZMQ scores
 |---|---|---|
 | **A — Data Factory** | Angel `SmartWebSocketV2` mode 3, ZMQ ipc publish | `alpha:hb:A` + `alpha:hb:data` |
 | **B — Alpha Engine** | 9 calculators + trade classification + EMA smoother | `alpha:hb:B` |
-| **C — Broadcaster** | Telegram bot + dedup + rate-limit + exit tracking | — |
+| **C — Broadcaster** | Telegram bot + dedup (cooldowns) + exit tracking | — |
 
 End-to-end latency: **~1 ms** tick-to-score-published, ~200 ms tick-to-Telegram (network dominant).
 
@@ -68,7 +68,9 @@ score  = clip(raw, −10, +10)  →  EMA smoother
 | 2 | **Alpha Engine alive** | `alpha:hb:B` (3s TTL, refreshed by Process B heartbeat thread) | `engine_dead` suppress |
 | 3 | **Manual mute** | Redis `alpha:mute` **OR** disk `MUTE_FILE` (fail-safe OR) | `muted` suppress |
 | 4 | **Spread filter** | Per-symbol `spread > 0.15%` gates score to 0 | Score=0, no alert |
-| 5 | **Rate cap** | 20/hour global · 5/symbol/session · per (sym,mode) cooldown | Alert dropped |
+| 5 | **Per-signal cooldown** | per (sym, mode) via Redis `SET NX EX` — prevents duplicate of same signal | Duplicate suppressed |
+
+> **No global rate limit by design.** This is an advisory system — user decides which alerts to trade. All qualifying signals are delivered. Cooldowns still prevent the SAME signal (e.g. RELIANCE MOMENTUM) from re-firing while score stays in trigger band.
 
 Suppression status visible in every `[C]` stats line as `suppressed=<reason>`.
 
@@ -186,7 +188,7 @@ Or use the update helper:
 **Live stats (every 10s from B, 15s from C):**
 ```
 [B] ticks=87 (8/s)  syms=5  top: RELIANCE=+0.42(ltp=1289.5)  TCS=-0.18(ltp=4102.0)  ...
-[C] {'scores': 130, 'no_mode': 130, 'muted': 0, 'no_data': 0, 'engine_dead': 0, 'cooldown': 0, 'rate': 0, 'sent': 0, 'exit_sent': 0, 'redis_err': 0}
+[C] {'scores': 130, 'no_mode': 130, 'muted': 0, 'no_data': 0, 'engine_dead': 0, 'cooldown': 0, 'sent': 0, 'exit_sent': 0, 'redis_err': 0}
 ```
 
 **When alerts fire:** message आपके phone पर, buttons पर tap करें.
@@ -270,7 +272,7 @@ WantedBy=multi-user.target
 
 - [x] 3-process pipeline scaffold with real Angel WS integration
 - [x] 9 calculators with amortized O(1) rolling windows
-- [x] Redis rate limits + cooldowns + mute (dual-write fail-safe OR)
+- [x] Cooldowns per (sym, mode) + mute (dual-write fail-safe OR)
 - [x] Spread filter kill switch
 - [x] Live stats prints (tick rate, top scores, broadcaster counters)
 - [x] IST timezone forcing (TZ env + tzset for C-level fast path)

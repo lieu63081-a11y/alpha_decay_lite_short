@@ -47,7 +47,9 @@ TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ANGEL_BIDASK_SWAPPED = os.getenv("ANGEL_BIDASK_SWAPPED", "0").strip() == "1"
 
 SPREAD_MAX, EMA_TAU        = 0.0015, 1.0
-RATE_GLOBAL, RATE_SYMBOL   = 20, 5
+# Rate limits removed by design: this system is advisory-only, user chooses
+# which alerts to trade. Cooldowns per (sym, mode) still enforced below to
+# prevent SAME signal firing repeatedly while score stays in trigger band.
 CD                         = {"MOMENTUM": 300, "MEAN_REVERSION": 45, "GAP_FADE": 180}
 HWM, LAT_WARN_MS           = 10000, 100
 MUTE_CACHE_TTL             = 1.0
@@ -382,14 +384,6 @@ def mode_for(score, rvol, gap=0.0):
     return None
 
 
-async def _rate_ok(r, sym):
-    hour, day = int(time.time() // 3600), time.strftime("%Y%m%d")
-    gkey, skey = f"alpha:count:global:{hour}", f"alpha:count:{sym}:{day}"
-    if int((await r.get(gkey)) or 0) >= RATE_GLOBAL: return False
-    if int((await r.get(skey)) or 0) >= RATE_SYMBOL: return False
-    p = r.pipeline(); p.incr(gkey); p.expire(gkey, 3700); p.incr(skey); p.expire(skey, 6*3600)
-    await p.execute(); return True
-
 async def _cooldown_ok(r, sym, mode):
     return bool(await r.set(f"alpha:cd:{sym}:{mode}", "1", ex=CD[mode], nx=True))
 
@@ -557,7 +551,7 @@ async def broadcaster_loop():
     _start_hb_thread("C", r_sync)
     await _tg_init(r)
     counts = {"scores": 0, "no_mode": 0, "muted": 0, "no_data": 0, "engine_dead": 0,
-              "cooldown": 0, "rate": 0, "sent": 0, "exit_sent": 0, "redis_err": 0}
+              "cooldown": 0, "sent": 0, "exit_sent": 0, "redis_err": 0}
     last_stats = time.time()
     supp = {"suppressed": False, "reason": "", "ts": 0.0}
     print("[C] Broadcaster up", flush=True)
@@ -592,6 +586,8 @@ async def broadcaster_loop():
                             print(f"[C] exit err: {e!r}", flush=True)
 
                     # 2) Entry alerts (GAP_FADE / MOMENTUM / MEAN_REVERSION)
+                    # No rate limiting -- advisory system; user decides which alerts to trade.
+                    # Only cooldown per (sym, mode) applied to prevent duplicate of same signal.
                     mode = mode_for(s["score"], s["rvol"], s.get("gap", 0.0))
                     if not mode:
                         counts["no_mode"] += 1
@@ -599,8 +595,6 @@ async def broadcaster_loop():
                         try:
                             if not await _cooldown_ok(r, s["sym"], mode):
                                 counts["cooldown"] += 1
-                            elif not await _rate_ok(r, s["sym"]):
-                                counts["rate"] += 1
                             else:
                                 counts["sent"] += 1
                                 await _tg_send_entry(r, s, mode)

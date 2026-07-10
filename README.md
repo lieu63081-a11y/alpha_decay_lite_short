@@ -2,31 +2,27 @@
 
 Signal-only NSE cash equity alerting engine. Advisory only — no order placement.
 
-Angel One SmartAPI se live market data lo, 60-second sliding window par score compute karo,
-high-quality Buy / Sell alerts Telegram par bhejo. User manually order place karta hai broker app par.
+Angel One SmartAPI से live market data लो, 60-second sliding window पर score compute करो, high-quality Buy/Sell alerts Telegram पर भेजो. User manually order place करता है broker app पर.
 
-> **Design contract:** Yeh system kabhi order fire nahi karta. Sirf actionable signals deliver karta hai.
-> Saara execution risk aur final trade decision user ke paas hai. **Algo advisory hai, algo execution nahi.**
+> **Design contract:** यह system कभी order fire नहीं करता. सिर्फ़ actionable signals deliver करता है. सारा execution risk और final trade decision user के पास है. **Algo advisory है, algo execution नहीं.**
 
 ---
 
 ## Architecture (3 processes)
 
 ```
-Angel WS (mode 3)  ->  Process A  --ZMQ ticks-->   Process B  --ZMQ scores-->  Process C  ->  Telegram
-                       Data Factory                Alpha Engine                 Broadcaster
-                                                   9 calc + EMA smoother        dedup + rate-limit + async Redis
+Angel WS (mode 3)  →  Process A  ─ZMQ ticks─→   Process B  ─ZMQ scores─→  Process C  →  Telegram
+                       Data Factory              Alpha Engine               Broadcaster
+                                                 9 calc + EMA smoother      dedup + rate-limit + bot
 ```
 
-| Process | Role | Tech |
+| Process | Role | Heartbeat |
 |---|---|---|
-| **A — Data Factory** | Angel `SmartWebSocketV2` snap-quote mode 3 subscribe, tick pack, ZMQ ipc publish | `smartapi-python`, `pyzmq` |
-| **B — Alpha Engine** | 9 calculators (amortized O(1) per tick), EMA smoother, feature score in `[-10, +10]` | `pyzmq`, `deque`-backed windows |
-| **C — Broadcaster** | Dedup + rate-limit + Telegram delivery, fully async | `zmq.asyncio`, `redis.asyncio` |
+| **A — Data Factory** | Angel `SmartWebSocketV2` mode 3, ZMQ ipc publish | `alpha:hb:A` + `alpha:hb:data` |
+| **B — Alpha Engine** | 9 calculators + trade classification + EMA smoother | `alpha:hb:B` |
+| **C — Broadcaster** | Telegram bot + dedup + rate-limit + exit tracking | — |
 
-Redis for state (rate counters, cooldowns, mute flag). TimescaleDB for logs (planned).
-
-Per-tick end-to-end latency: **~1 ms** tick-to-score-published, ~200 ms tick-to-Telegram (network dominant).
+End-to-end latency: **~1 ms** tick-to-score-published, ~200 ms tick-to-Telegram (network dominant).
 
 ---
 
@@ -34,50 +30,85 @@ Per-tick end-to-end latency: **~1 ms** tick-to-score-published, ~200 ms tick-to-
 
 | # | Function | Role |
 |---|----------|------|
-| 1 | `_c1_vwap_distance`  | % distance of LTP from daily VWAP (mean-reversion setup) |
-| 2 | `_c2_rvol`           | 60s volume vs 20-min per-minute average (via two `WindowSum`) |
-| 3 | `_c3_agg_buy`        | Lee-Ready: LTP vs (bid+ask)/2 → +1 / 0 / -1 |
-| 4 | `_c4_absorption`     | **Symmetric**: sell-absorb (+1.5 bullish) / buy-absorb (-1.5 bearish trap) |
-| 5 | `_c5_imbalance`      | L1 book (buy_qty − sell_qty)/(buy_qty + sell_qty) × 2 |
+| 1 | `_c1_vwap_distance`  | LTP % distance from daily VWAP (mean-reversion setup) |
+| 2 | `_c2_rvol`           | 60s vol vs 20-min baseline **excluding self**, warm-up gated at 5 min |
+| 3 | `_c3_agg_buy`        | **Rolling 30s** net aggressive buy/sell (Lee-Ready + tick-rule) |
+| 4 | `_c4_absorption`     | **Trade-classified** symmetric absorption: +1.5 sell-absorb / −1.5 buy-absorb |
+| 5 | `_c5_imbalance`      | L5 book depth imbalance |
 | 6 | `_c6_spread`         | Spread filter (> 0.15% → score gated to 0) |
-| 7 | `_c7_gap`            | Gap fade in 9:15–9:30 IST window (planned mode trigger) |
-| 8 | `_c8_session_weight` | OPEN_VOL 1.2 · MID_QUIET 0.8 · CLOSE_HOUR 1.1 |
-| 9 | EMA smoother         | `alpha = 1 − exp(-dt / tau)`, `tau = 1.0s`; first-tick init separated, dt=0 preserves prev score |
+| 7 | `_c7_gap`            | Gap fade in 9:15–9:30 IST window |
+| 8 | `_c8_session_weight` | OPEN_VOL 1.2 · MID_QUIET 0.8 · CLOSE_HOUR 1.1 (IST) |
+| 9 | EMA smoother         | `α = 1 − exp(−dt/τ)`, τ=1s; first-tick init separated; batched ticks preserve prev |
 
 **Aggregator:**
 ```
-hidden = max(agg, absb) + 0.4 × min(agg, absb)            # same-sign dampen
-raw    = session_w × (2.0·vwap + 1.5·hidden + 1.5·imb + 1.0·gap)
-score  = clip(raw, -10, +10)  →  EMA smoother
+hidden = max(agg,absb) + 0.4·min(agg,absb)   [if same sign — dampen redundancy]
+       = agg + absb                          [if opposite — additive net]
+raw    = session_w × (2·vwap + 1.5·hidden + 1.5·imb + 1.0·gap)
+score  = clip(raw, −10, +10)  →  EMA smoother
 ```
 
 ---
 
 ## Signal Modes
 
-| Mode | Trigger | Cooldown | SL suggestion |
-|------|---------|----------|---------------|
-| `MOMENTUM`       | `|score| ≥ 8` and `rvol ≥ 1.5` | 300 s | 1.5% |
-| `MEAN_REVERSION` | `3 ≤ |score| < 8` and `rvol < 2.0` | 45 s | 0.5% |
-| `GAP_FADE`       | 9:15–9:30 IST, `|gap| > 1%` *(planned)* | 180 s | gap-based |
-
-Gray-area handling: score ≥ 8 with rvol < 1.5 (suspicious high-score without volume confirmation) currently returns no signal — consider it a future `FAKE_BREAKOUT` mode.
+| Mode | Trigger | Cooldown | SL |
+|------|---------|----------|-----|
+| `MOMENTUM`       | \|score\| ≥ 8, rvol ≥ 1.5 | 300 s | 1.5% |
+| `MEAN_REVERSION` | 3 ≤ \|score\| < 8, rvol < 2.0 | 45 s | 0.5% |
+| `GAP_FADE`       | 9:15–9:30 IST, \|gap\| > 1% *(planned)* | 180 s | gap-based |
 
 ---
 
-## Rate Limits & Kill Switches
+## Kill Switches (5 layers)
 
-**Rate limits:**
-- Global: max **20 alerts / hour** (`alpha:count:global:{hour}`)
-- Per symbol: max **5 alerts / session** (`alpha:count:{sym}:{YYYYMMDD}`)
-- Per (symbol, mode) cooldown via Redis `SET NX EX` (`alpha:cd:{sym}:{mode}`)
+| # | Layer | Mechanism | Result on trigger |
+|---|-------|-----------|-------------------|
+| 1 | **WS data flow** | `alpha:hb:data` (5s TTL, refreshed only on live ticks in Process A) | `no_data` suppress |
+| 2 | **Alpha Engine alive** | `alpha:hb:B` (3s TTL, refreshed by Process B heartbeat thread) | `engine_dead` suppress |
+| 3 | **Manual mute** | Redis `alpha:mute` **OR** disk `MUTE_FILE` (fail-safe OR) | `muted` suppress |
+| 4 | **Spread filter** | Per-symbol `spread > 0.15%` gates score to 0 | Score=0, no alert |
+| 5 | **Rate cap** | 20/hour global · 5/symbol/session · per (sym,mode) cooldown | Alert dropped |
 
-**Kill switches:**
-1. Market data heartbeat — no tick 5s → suppress alerts *(planned)*
-2. Process heartbeat via Redis TTL — miss > 3s → pause *(planned)*
-3. Manual mute — Redis flag OR disk file (fail-safe OR-read)
-4. Spread filter per-symbol — `> 0.15%` → score gated to 0
-5. Alert rate cap (see above)
+Suppression status visible in every `[C]` stats line as `suppressed=<reason>`.
+
+---
+
+## Telegram Bot Integration
+
+### Entry Alert (with buttons)
+
+```
+🔔 [MOMENTUM] RELIANCE LONG
+score=+8.42  peak=8.67  ltp=1289.50
+suggested SL: 1.5%
+advisory only — user executes manually
+
+[✅ ACK]    [⏭️ SKIP]
+```
+
+- **ACK** → position tracked in Redis (`alpha:pos:{sym}`, 6h TTL). Broker पर manually order place करें.
+- **SKIP** → logged in `alpha:skip:{YYYYMMDD}` for backtest, 30-day retention.
+
+### Exit Alert (auto-fires when ACK'd position's score decays to ±2)
+
+```
+⚠️ EXIT — RELIANCE (MOMENTUM LONG)
+score decayed to +1.82 (entry +8.42)
+ltp 1295.30 (entry 1289.50, delta +0.45%)
+consider closing position
+
+[✔️ DONE]  [⏳ HOLD MORE]
+```
+
+- **DONE** → position deleted, no more exit alerts.
+- **HOLD MORE** → exit cooldown doubles (10 min); wait for further decay.
+
+### Persistence
+
+- `alpha:pending:{message_id}` (24h TTL) — stores entry details until ACK/SKIP. Survives process restart.
+- `alpha:pos:{sym}` (6h TTL) — active tracked position. Auto-cleanup after 6h.
+- `alpha:exitcd:{sym}` (5 min TTL) — prevents exit alert spam.
 
 ---
 
@@ -85,62 +116,55 @@ Gray-area handling: score ≥ 8 with rvol < 1.5 (suspicious high-score without v
 
 ### 1. Prerequisites
 
-- Ubuntu 24.04 LTS (or any Linux with Python 3.10+)
+- Ubuntu 24.04 LTS (or Linux with Python 3.10+)
 - Redis 7 running locally
-- Angel SmartAPI account with:
-  - API key (from smartapi.angelbroking.com)
-  - Client code (e.g. `P12345678`)
-  - **4-digit MPIN** (not web login password)
-  - TOTP secret (base32 string, set during TOTP enrollment)
-- Telegram bot token + chat ID (planned)
+- Angel SmartAPI account (API key, client code, 4-digit MPIN, TOTP secret)
+- Telegram bot from `@BotFather` + your chat ID
 
 ### 2. Install
 
 ```bash
-sudo apt update && sudo apt install -y python3-pip python3-venv python3-dev redis-server git
+sudo apt install -y python3-pip python3-venv python3-dev redis-server git
 sudo systemctl enable --now redis-server
 
 git clone https://github.com/lieu63081-a11y/alpha_decay_lite_short.git
 cd alpha_decay_lite_short
-
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip wheel
-pip install -r requirements.txt
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip wheel && pip install -r requirements.txt
 ```
 
 ### 3. Configure
 
 ```bash
-cp .env.example .env
-nano .env
+cp .env.example .env && nano .env
+sudo timedatectl set-ntp true    # critical for TOTP
 ```
 
 **Required env vars:**
 
-| Var | Value |
-|---|---|
-| `ANGEL_API_KEY` | SmartAPI key |
-| `ANGEL_CLIENT_CODE` | Client ID (e.g. `P12345678`) |
-| `ANGEL_PASSWORD` | **4-digit MPIN** (NOT web login password) |
-| `ANGEL_TOTP_SECRET` | Base32 secret string (not 6-digit code) |
-| `TELEGRAM_TOKEN` | Bot token from `@BotFather` (planned) |
-| `TELEGRAM_CHAT_ID` | Your Telegram chat ID (planned) |
-| `UNIVERSE` | Comma-separated NSE symbols (e.g. `RELIANCE,TCS,HDFCBANK`) |
-| `REDIS_URL` | Default: `redis://localhost:6379/0` |
-| `MUTE_FILE` | Default: `/tmp/alpha_mute.flag` |
+| Var | Value | Notes |
+|---|---|---|
+| `ANGEL_API_KEY` | SmartAPI key | from `smartapi.angelbroking.com` |
+| `ANGEL_CLIENT_CODE` | e.g. `P12345678` | your client ID |
+| `ANGEL_PASSWORD` | **4-digit MPIN** | NOT web login password |
+| `ANGEL_TOTP_SECRET` | base32 secret | full string, not 6-digit code |
+| `TELEGRAM_TOKEN` | bot token | from `@BotFather` |
+| `TELEGRAM_CHAT_ID` | chat ID | get from `@userinfobot` |
+| `UNIVERSE` | comma-separated symbols | e.g. `RELIANCE,TCS,YESBANK,ZOMATO` |
+| `REDIS_URL` | default `redis://localhost:6379/0` | |
+| `MUTE_FILE` | default `/tmp/alpha_mute.flag` | |
+| `AUTO_RESTART_HOURS` | default `20` | JWT auto-refresh; systemd restarts process |
 
-### 4. Time sync (critical for TOTP)
-
-```bash
-sudo timedatectl set-ntp true
-timedatectl   # verify "System clock synchronized: yes"
-```
-
-### 5. Run
+### 4. Run
 
 ```bash
 python alpha_decay_lite.py
+```
+
+Or use the update helper:
+
+```bash
+./update.sh --run    # git pull + pip install + launch
 ```
 
 ---
@@ -151,44 +175,21 @@ python alpha_decay_lite.py
 ```
 [B] Alpha Engine up
 [C] Broadcaster up
-[I 260710 ...] in pool
-[A] Logging in to Angel...
+[C] Telegram bot up (chat=123456789)
 [A] Login OK, client=P12345678
-[A] Downloading scrip master (~4 MB)...
 [A] Scrip master loaded in 12.3s, resolved 5/5 symbols
 [A] Data Factory up, 5 tokens mode=3
 ```
 
-**Live stats (every 10s from B, every 15s from C):**
+आपके Telegram पर: `🟢 Alpha-Decay Lite bot online`
+
+**Live stats (every 10s from B, 15s from C):**
 ```
 [B] ticks=87 (8/s)  syms=5  top: RELIANCE=+0.42(ltp=1289.5)  TCS=-0.18(ltp=4102.0)  ...
-[C] {'scores': 130, 'no_mode': 130, 'muted': 0, 'cooldown': 0, 'rate': 0, 'sent': 0}
+[C] {'scores': 130, 'no_mode': 130, 'muted': 0, 'no_data': 0, 'engine_dead': 0, 'cooldown': 0, 'rate': 0, 'sent': 0, 'exit_sent': 0, 'redis_err': 0}
 ```
 
-**On alert (currently stub — prints to stdout):**
-```
-[TG]
-[MEAN_REVERSION] RELIANCE LONG
-score=+3.42  peak=3.58  ltp=1289.5
-suggested SL: 0.5%
-advisory only -- user executes manually
----
-```
-
-### Understanding Stats
-
-**Process B:**
-- `ticks=N (r/s)` — ticks received in last 10s / rate per second
-- `syms=N` — active symbols tracked
-- `top:` — top 5 symbols by absolute EMA score, sign shows direction
-
-**Process C counters** (reset every 15s):
-- `scores` — total scores received from B
-- `no_mode` — score didn't hit mode threshold (score too small, or wrong rvol regime)
-- `muted` — mute flag was set
-- `cooldown` — same (sym, mode) alerted recently
-- `rate` — global/symbol rate limit hit
-- `sent` — actual Telegram alerts fired
+**When alerts fire:** message आपके phone पर, buttons पर tap करें.
 
 ---
 
@@ -197,35 +198,32 @@ advisory only -- user executes manually
 ### Emergency mute (dual-write, fail-safe OR)
 
 ```bash
-redis-cli set alpha:mute 1        # Redis path
-touch /tmp/alpha_mute.flag        # disk path
+redis-cli set alpha:mute 1        # या
+touch /tmp/alpha_mute.flag
 ```
 
-Either one alone will suppress alerts. To unmute:
-
+Unmute:
 ```bash
-redis-cli del alpha:mute
-rm -f /tmp/alpha_mute.flag
+redis-cli del alpha:mute && rm -f /tmp/alpha_mute.flag
 ```
 
 ### Inspect state
 
 ```bash
-redis-cli keys 'alpha:*'                    # all runtime keys
-redis-cli get alpha:count:global:$(date +%s | awk '{print int($1/3600)}')   # global counter
-watch -n 2 'redis-cli --scan --pattern "alpha:*" | head -20'
+redis-cli keys 'alpha:*'
+watch -n 2 'redis-cli --scan --pattern "alpha:pos:*"'   # active tracked positions
+redis-cli lrange "alpha:skip:$(date +%Y%m%d)" 0 -1     # today's skipped signals
 ```
 
-### Add symbols to universe
+### Health monitoring
 
-Edit `.env`:
+```bash
+redis-cli get alpha:hb:A       # Process A alive (should return "1", TTL 1-3s)
+redis-cli get alpha:hb:B       # Process B alive
+redis-cli get alpha:hb:data    # Data flowing (only if ticks recent)
 ```
-UNIVERSE=RELIANCE,TCS,HDFCBANK,INFY,ICICIBANK,ADANIENT,YESBANK,ZOMATO,PAYTM
-```
 
-Restart the process. Volatile mid-caps produce far more signal activity than blue chips.
-
-### Run as background service (systemd)
+### systemd service
 
 ```ini
 # /etc/systemd/system/alpha-decay.service
@@ -240,7 +238,7 @@ User=alpha
 WorkingDirectory=/home/alpha/alpha_decay_lite_short
 EnvironmentFile=/home/alpha/alpha_decay_lite_short/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/alpha/alpha_decay_lite_short/.venv/bin/python /home/alpha/alpha_decay_lite_short/alpha_decay_lite.py
+ExecStart=/home/alpha/alpha_decay_lite_short/.venv/bin/python alpha_decay_lite.py
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:/var/log/alpha-decay.log
@@ -250,56 +248,21 @@ StandardError=append:/var/log/alpha-decay.log
 WantedBy=multi-user.target
 ```
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now alpha-decay
-tail -f /var/log/alpha-decay.log
-```
-
 ---
 
 ## Troubleshooting
 
-| Error | Cause | Fix |
-|---|---|---|
-| `ModuleNotFoundError: requests` (or any) | Deps not installed in active venv | `pip install -r requirements.txt` |
-| `ModuleNotFoundError: logzero` | SmartAPI transitive dep — already pinned in requirements.txt | `pip install logzero websocket-client` |
-| `Invalid password parameter name` | Using web login password instead of MPIN | Set `ANGEL_PASSWORD=<4-digit-MPIN>` |
-| `Invalid Token` / `AB1050` | TOTP time drift | `sudo timedatectl set-ntp true` |
-| `[A] FATAL missing env vars: [...]` | `.env` incomplete | Fill all Angel + Telegram fields |
-| Silent hang after "in pool" | Scrip master download (~4 MB) in progress | Wait 30–60s (slower on far-region VPS) |
-| Ticks not flowing | Market closed (9:15–15:30 IST Mon–Fri) | Wait for market open |
-| Scores stuck at 0.0 | All symbols failing spread filter or MID_QUIET blue-chips | Add mid-cap volatile symbols to UNIVERSE |
-| `high lat=` warnings | Process B falling behind | Reduce universe size or shard engine |
-
-**Diagnostic: verify env vars loaded (without exposing values):**
-
-```bash
-python -c "
-from dotenv import load_dotenv, find_dotenv
-import os
-load_dotenv(find_dotenv())
-for k in ['ANGEL_API_KEY','ANGEL_CLIENT_CODE','ANGEL_PASSWORD','ANGEL_TOTP_SECRET']:
-    v = os.getenv(k)
-    print(f'{k}: {\"SET len=\"+str(len(v)) if v else \"MISSING/EMPTY\"}')"
-```
-
-**Reset MPIN (if forgotten):**
-Angel One mobile app → Profile → Settings → Reset MPIN → OTP → new 4-digit.
-
----
-
-## VPS Recommendations
-
-| Scenario | Provider | Cost/month |
-|---|---|---|
-| Free dev / validation | Oracle Cloud Free Tier (Mumbai, 2 OCPU / 12 GB ARM) | ₹0 |
-| Best paid, hourly billing | DigitalOcean Bangalore (4 vCPU / 8 GB) | ~₹4,000 |
-| Cheapest paid (Mumbai) | Contabo India (4 vCPU / 8 GB) | ~₹800 |
-| Mumbai region + hourly | AWS Lightsail ap-south-1 (4 vCPU / 8 GB) | ~₹3,300 |
-| INR billing | E2E Networks Mumbai | ~₹3,000-5,000 |
-
-Signal-only system — no HFT latency budget. 10–20 ms to NSE Mumbai is more than enough (user's manual order-placement latency dominates anyway).
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `ModuleNotFoundError` | Venv deps missing | `pip install -r requirements.txt` |
+| `Invalid password parameter name` | Web password instead of MPIN | Set `ANGEL_PASSWORD=<4-digit-MPIN>` |
+| `Invalid Token` / TOTP fail | Clock drift | `sudo timedatectl set-ntp true` |
+| Silent hang after "in pool" | Scrip master downloading | Wait 30-60s |
+| Bot not sending | `TELEGRAM_TOKEN` or `TELEGRAM_CHAT_ID` missing/wrong | Verify with `grep TELEGRAM .env` |
+| `[C] suppressed=engine_dead` | Process B down or stuck | Check `[B]` output; restart if needed |
+| `[C] suppressed=no_data` | Angel WS disconnected or market closed | Wait for reconnect / market hours |
+| `[C] {'redis_err': N}` | Redis down or unreachable | Check `systemctl status redis-server` |
+| Alerts stopped after 20h | JWT auto-refresh triggered | Systemd will auto-restart; else run again |
 
 ---
 
@@ -307,17 +270,24 @@ Signal-only system — no HFT latency budget. 10–20 ms to NSE Mumbai is more t
 
 - [x] 3-process pipeline scaffold with real Angel WS integration
 - [x] 9 calculators with amortized O(1) rolling windows
-- [x] Redis-backed rate limits + cooldowns
-- [x] Mute (Redis + disk dual-write, fail-safe OR)
+- [x] Redis rate limits + cooldowns + mute (dual-write fail-safe OR)
 - [x] Spread filter kill switch
 - [x] Live stats prints (tick rate, top scores, broadcaster counters)
-- [ ] Kill switches #1 (WS 5s heartbeat) + #2 (Redis TTL 3s heartbeat)
-- [ ] Telegram bot with ACK/SKIP inline buttons + tracked_position in Redis
-- [ ] Exit alerts when ACK'd positions decay back to ±2
+- [x] IST timezone forcing (TZ env + tzset for C-level fast path)
+- [x] RVOL warmup gate + self-exclusion (correct 5x = 5.0 exact)
+- [x] Time-based peak decay (60s half-life)
+- [x] JWT auto-refresh (20h scheduled restart)
+- [x] Graceful shutdown with watchdog (SIGTERM → 5s → SIGKILL)
+- [x] Kill switches #1 (WS 5s heartbeat) + #2 (Redis TTL 3s heartbeat)
+- [x] **Telegram bot with ACK/SKIP/DONE/HOLD inline buttons**
+- [x] **Exit alerts when ACK'd position score decays to ±2**
+- [x] **Trade-classified absorption (Lee-Ready + tick-rule)**
+- [x] **Rolling 30s aggression window (replaces per-tick noise)**
 - [ ] GAP_FADE mode trigger in `mode_for()`
 - [ ] TimescaleDB async logger for tick + score history
 - [ ] Scrip master disk cache with mtime check
 - [ ] Backtest harness against 3-month historical tick data
+- [ ] LUNCH_HOUR sub-band (12:00-13:30 IST) tuning
 
 ---
 
@@ -325,11 +295,12 @@ Signal-only system — no HFT latency budget. 10–20 ms to NSE Mumbai is more t
 
 - Python 3.10+ (Ubuntu 24.04 default is 3.12)
 - Redis 7+ (AOF everysec recommended)
-- Optional: TimescaleDB 2 on PostgreSQL 16 (planned)
+- `python-telegram-bot` v21+ (async, `Application`-based)
 
 ## Files
 
-- `alpha_decay_lite.py` — single-file 3-process pipeline (~250 lines)
-- `requirements.txt` — Python dependencies (SmartAPI transitive deps pinned)
-- `.env.example` — env template for credentials + universe
+- `alpha_decay_lite.py` — 3-process pipeline (~625 lines)
+- `requirements.txt` — Python deps (SmartAPI transitive deps pinned)
+- `.env.example` — env template
 - `.gitignore` — excludes `.env`, `.venv`, logs, IPC sockets, Redis dumps
+- `update.sh` — one-shot pull + deps refresh + launch

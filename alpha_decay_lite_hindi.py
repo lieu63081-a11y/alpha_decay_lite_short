@@ -248,15 +248,11 @@ def is_within_trading_hours(timestamp):
     पड़ेगा, और practical cost शून्य है -- अगर holiday को 'market closed
     but watchdog stays quiet anyway' मान लिया जाए, तो नुक़सान कुछ नहीं
     क्योंकि holiday पर ticks आते ही नहीं)। यह function data_factory के
-    a holiday regardless). Used by data_factory's tick-starvation
-    watchdog: without this check, the watchdog would misinterpret every
-    single overnight/weekend silence -- when Angel's feed legitimately
-    sends zero ticks for hours -- as a zombie connection, force-exiting
-    tick-starvation watchdog में इस्तेमाल होता है: इस check के बिना, watchdog
-    हर रात/weekend पर misfire होगा (जब घंटों तक zero ticks आना बिल्कुल
-    normal है), Process A को बार-बार restart करेगा और launcher का crash-loop
-    breaker trip कर देगा -- जो फिर sys.exit(1) करके पूरा system बंद कर देगा
-    (Process B और C सहित, सिर्फ़ A नहीं)।"""
+    tick-starvation watchdog में इस्तेमाल होता है: इस check के बिना,
+    watchdog हर रात/weekend पर misfire होगा (जब घंटों तक zero ticks आना
+    बिल्कुल normal है), Process A को बार-बार restart करेगा और launcher
+    का crash-loop breaker trip कर देगा -- जो फिर sys.exit(1) करके पूरा
+    system बंद कर देगा (Process B और C सहित, सिर्फ़ A नहीं)।"""
     local_time = time.localtime(timestamp)
     if local_time.tm_wday >= 5:   # शनिवार=5, रविवार=6
         return False
@@ -1373,32 +1369,35 @@ def determine_signal_modes(composite_score, relative_volume, gap_fade_raw_score=
     absolute_score = abs(composite_score)
     if absolute_score >= 8 and relative_volume >= 1.5:
         qualifying_modes.append("MOMENTUM")
-    # NOTE: this used to be `elif 3 <= absolute_score < 8 and relative_volume
-    # < 2.0`, which created a "dead zone": a score of e.g. 9.5 (well above
-    # MOMENTUM's own >=8 threshold) with relative_volume=1.2 (just below
-    # MOMENTUM's >=1.5 volume requirement) failed BOTH branches -- it missed
-    # MOMENTUM on volume, and missed MEAN_REVERSION too because its upper
-    # bound of "< 8" excluded any score that high. The signal was silently
-    # dropped entirely despite an unusually strong price move, exactly the
-    # kind of low-volume/high-score situation (e.g. spoofing, an illiquid
-    # circuit-adjacent move) this system should NOT go blind on. Verified
-    # via simulation: composite_score=9.5, relative_volume=1.2 returned []
-    # under the old condition. Dropping the "< 8" upper bound means any
-    # score that fails MOMENTUM's volume gate falls back to being evaluated
-    # as MEAN_REVERSION instead of falling through entirely -- MOMENTUM and
-    # MEAN_REVERSION remain mutually exclusive with each other (the `elif`
-    # is still gated on MOMENTUM's own condition not having matched), just
-    # without the extra score<8 restriction on the fallback path.
+    # NOTE: यह पहले `elif 3 <= absolute_score < 8 and relative_volume
+    # < 2.0` था, जिसने एक "dead zone" बनाया था: एक score जैसे 9.5
+    # (MOMENTUM के अपने >=8 threshold से काफ़ी ऊपर) साथ में
+    # relative_volume=1.2 (MOMENTUM के >=1.5 volume requirement से बस
+    # थोड़ा नीचे) दोनों branches में fail होता -- MOMENTUM पर volume की
+    # वजह से miss हो जाता, और MEAN_REVERSION पर भी miss होता क्योंकि
+    # उसका "< 8" upper bound उतना ऊँचा score exclude कर देता। ऐसा
+    # signal, जो एक असामान्य तौर पर strong price move दिखा रहा है,
+    # चुपचाप पूरी तरह drop हो जाता -- ठीक वैसे low-volume/high-score
+    # situations में (जैसे spoofing, illiquid circuit-adjacent move)
+    # जहाँ यह system को blind नहीं होना चाहिए। Simulation से verified:
+    # composite_score=9.5, relative_volume=1.2 पर पुरानी condition से
+    # [] return होता था। "< 8" upper bound हटाने का मतलब है कि कोई भी
+    # score जो MOMENTUM के volume gate पर fail हो, वो fall through होने
+    # बजाय पूरी तरह से fall through कर जाने के, MEAN_REVERSION के तौर पर
+    # evaluate होगा -- MOMENTUM और MEAN_REVERSION एक-दूसरे से mutually
+    # exclusive बने रहते हैं (`elif` अभी भी MOMENTUM की अपनी condition
+    # match न होने पर gated है), बस fallback path पर score<8 वाला extra
+    # restriction नहीं है।
     elif absolute_score >= 3 and relative_volume < 2.0:
         qualifying_modes.append("MEAN_REVERSION")
     return qualifying_modes
 
 
 async def is_entry_cooldown_expired(redis_client, symbol, mode):
-    """Atomically sets a cooldown key for (symbol, mode) if and only if
-    it doesn't already exist. Returns True (cooldown "expired"/available)
-    only on the call that successfully sets the key -- every subsequent
-    call within the cooldown window returns False."""
+    """(symbol, mode) के लिए एक cooldown key atomically set करता है, लेकिन
+    सिर्फ़ तभी जब वह पहले से मौजूद न हो। True (cooldown "expired"/available)
+    सिर्फ़ उस call पर return करता है जिसने key को successfully set किया --
+    cooldown window के अंदर हर बाद वाला call False return करेगा।"""
     cooldown_key = f"alpha:cd:{symbol}:{mode}"
     was_newly_set = await redis_client.set(
         cooldown_key, "1", ex=COOLDOWN_SECONDS_BY_MODE[mode], nx=True)
@@ -1406,11 +1405,11 @@ async def is_entry_cooldown_expired(redis_client, symbol, mode):
 
 
 async def is_exit_cooldown_expired(redis_client, symbol, mode):
-    """Same pattern as is_entry_cooldown_expired, but for exit alerts.
-    Keyed by (symbol, mode) -- matching the tracked-position key -- so
-    that concurrently tracked positions for the same symbol under
-    different modes (e.g. RELIANCE GAP_FADE and RELIANCE MOMENTUM both
-    ACK'd) get independent exit-alert cooldowns rather than sharing one."""
+    """is_entry_cooldown_expired जैसा ही pattern, लेकिन exit alerts के
+    लिए। (symbol, mode) से key बनती है -- tracked-position key जैसी ही --
+    ताकि एक ही symbol पर different modes में concurrently tracked
+    positions (जैसे RELIANCE GAP_FADE और RELIANCE MOMENTUM दोनों ACK'd)
+    को independent exit-alert cooldowns मिलें, न कि एक ही share करें।"""
     cooldown_key = f"alpha:exitcd:{symbol}:{mode}"
     was_newly_set = await redis_client.set(
         cooldown_key, "1", ex=EXIT_ALERT_COOLDOWN_SECONDS, nx=True)
@@ -1418,7 +1417,7 @@ async def is_exit_cooldown_expired(redis_client, symbol, mode):
 
 
 def build_entry_alert_text(score_data, mode):
-    """Builds the human-readable text for an entry alert message."""
+    """एक entry alert message के लिए human-readable text बनाता है।"""
     direction = determine_entry_direction(score_data, mode)
 
     stop_loss_text_by_mode = {
@@ -1437,17 +1436,17 @@ def build_entry_alert_text(score_data, mode):
 
 
 def build_exit_alert_text(symbol, tracked_position, current_score, current_last_traded_price):
-    """Builds the human-readable text for an exit alert message, fired
-    when an ACK'd position's score has moved back toward (or through)
-    the exit threshold. current_score is whichever metric actually
-    decided the exit for this position's mode (the gap score for
-    GAP_FADE, the composite score for every other mode) -- see the
-    caller (send_exit_alert) for why this matters."""
-    # Prefer the direction saved at entry time (correct for every mode,
-    # including GAP_FADE). Fall back to deriving it from score_at_entry
-    # only for positions created before this field existed -- using
-    # .get() for score_at_entry too, so a malformed/partial Redis record
-    # degrades to a default instead of raising KeyError here.
+    """एक exit alert message के लिए human-readable text बनाता है, जो तब
+    fire होता है जब किसी ACK'd position का score exit threshold की तरफ
+    (या उसके पार) चला गया हो। current_score वो metric है जिसने वाकई इस
+    position के mode के लिए exit decide किया (GAP_FADE के लिए gap score,
+    बाकी हर mode के लिए composite score) -- देखें caller (send_exit_alert)
+    क्यों यह matter करता है।"""
+    # entry time पर saved direction को prefer करें (हर mode के लिए सही,
+    # GAP_FADE भी शामिल)। Fall back सिर्फ़ उन positions के लिए, जो इस
+    # field के add होने से पहले बनी थीं -- score_at_entry के लिए भी
+    # .get() इस्तेमाल किया है ताकि एक malformed/partial Redis record
+    # gracefully default पर degrade हो जाए, KeyError raise न हो।
     direction = tracked_position.get(
         "direction", "LONG" if tracked_position.get("score_at_entry", 0.0) > 0 else "SHORT")
     entry_price = tracked_position.get("ltp_entry", 0)
@@ -1457,12 +1456,13 @@ def build_exit_alert_text(symbol, tracked_position, current_score, current_last_
     if direction == "SHORT":
         profit_loss_percent = -profit_loss_percent
 
-    # .get() with a default everywhere a Redis-stored dict field is read,
-    # not direct indexing -- a tracked_position dict could in principle be
-    # missing a field (e.g. it was written by an older version of this
-    # code before a field was added, or Redis data was manually edited),
-    # and a direct tracked_position['field'] access would raise KeyError
-    # and crash this exit-alert path instead of degrading gracefully.
+    # Redis-stored dict field पढ़ने पर हर जगह .get() default के साथ,
+    # direct indexing नहीं -- एक tracked_position dict में कोई field
+    # missing हो सकती है (जैसे यह इस code के किसी पुराने version से
+    # लिखी गई हो जब वो field add नहीं हुई थी, या Redis data manually
+    # edit हुआ हो), और direct tracked_position['field'] access
+    # KeyError raise करके इस exit-alert path को crash कर देगा gracefully
+    # degrade होने के बजाय।
     mode_text = tracked_position.get("mode", "UNKNOWN")
     score_at_entry = tracked_position.get("score_at_entry", 0.0)
 
@@ -1474,15 +1474,16 @@ def build_exit_alert_text(symbol, tracked_position, current_score, current_last_
             f"consider closing position")
 
 
-# ---- Telegram bot state (module-level so the send helpers can reach the running app) ----
+# ---- Telegram bot state (module-level ताकि send helpers running app तक पहुँच सकें) ----
 TELEGRAM_BOT_STATE = {"application": None, "entry_keyboard_builder": None, "exit_keyboard_builder": None}
 
 
 async def initialize_telegram_bot(redis_client_async):
-    """Sets up the python-telegram-bot Application, registers the button
-    callback handler, and sends a startup ping. If TELEGRAM_BOT_TOKEN or
-    TELEGRAM_CHAT_ID are missing, or the library import/init fails, the
-    bot stays disabled and all alerts fall back to stdout printing."""
+    """python-telegram-bot Application को set up करता है, button callback
+    handler को register करता है, और एक startup ping भेजता है। अगर
+    TELEGRAM_BOT_TOKEN या TELEGRAM_CHAT_ID missing हो, या library
+    import/init fail हो, तो bot disabled रहेगा और सारे alerts stdout
+    पर print होंगे।"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[C] TELEGRAM_TOKEN/CHAT_ID missing — bot disabled, alerts to stdout", flush=True)
         return
@@ -1507,40 +1508,44 @@ async def initialize_telegram_bot(redis_client_async):
             mode = callback_parts[2] if len(callback_parts) > 2 else ""
             redis_client = context.application.bot_data["redis"]
 
-            # NOTE: edit_message_text() accepts a reply_markup parameter that
-            # replaces (or, when None, removes) the message's inline keyboard
-            # in the SAME API call. Making one call instead of two (a prior
-            # version called edit_message_reply_markup then edit_message_text
-            # separately) halves Telegram API usage per button press and
-            # avoids a 'Message is not modified' race between the two calls.
+            # NOTE: edit_message_text() एक reply_markup parameter accept
+            # करता है जो एक ही API call में message के inline keyboard
+            # को replace कर देता है (या None पास करने पर हटा देता है)।
+            # दो calls की जगह एक call करने से (एक पुराने version में
+            # पहले edit_message_reply_markup और फिर edit_message_text
+            # अलग-अलग call होते थे) हर button press पर Telegram API का
+            # usage आधा हो जाता है, और दोनों calls के बीच की 'Message
+            # is not modified' race भी टल जाती है।
             #
-            # We read message.text_html (HTML-escaped: '&','<','>' become
-            # '&amp;','&lt;','&gt;') and pass parse_mode="HTML" on every
-            # edit_message_text call below so Telegram actually interprets
-            # those entities instead of showing them as literal text. Using
-            # text_html WITHOUT parse_mode="HTML" (an earlier version of
-            # this code did exactly that) would show raw HTML-escaped
-            # entities to the user, e.g. "S&amp;P" instead of "S&P", the
-            # moment any alert text contains such a character. Current
-            # alert text has none of those characters today, but this pairs
-            # the escaping with the matching parse_mode so it stays correct
-            # if that ever changes, rather than leaving a latent bug for
-            # whoever edits build_entry_alert_text next.
+            # हम message.text_html पढ़ते हैं (HTML-escaped: '&','<','>'
+            # '&amp;','&lt;','&gt;' बन जाते हैं) और नीचे हर edit_message_
+            # text call पर parse_mode="HTML" pass करते हैं ताकि Telegram
+            # वाकई इन entities को interpret करे, न कि उन्हें literal text
+            # के तौर पर दिखाए। text_html इस्तेमाल करना बिना parse_mode=
+            # "HTML" के (जैसा इस code के एक पुराने version में हुआ था)
+            # यूज़र को raw HTML-escaped entities दिखा देगा, जैसे "S&P"
+            # की जगह "S&amp;P", जिस moment कोई alert text इन characters
+            # में से एक भी contain करे। आज के alert text में ऐसे characters
+            # नहीं हैं, पर यह escaping को matching parse_mode के साथ pair
+            # कर देता है ताकि आगे कुछ बदले तो भी सही रहे, बजाय एक latent
+            # bug छोड़ने के जो अगले किसी को झेलना पड़े जो build_entry_
+            # alert_text edit करे।
             original_text_html = callback_query.message.text_html
 
             if action == "ACK":
                 pending_info = await redis_client.get(
                     f"alpha:pending:{callback_query.message.message_id}")
                 if pending_info:
-                    # NOTE: the tracked-position key includes MODE, not just
-                    # symbol (alpha:pos:{symbol}:{mode}, not alpha:pos:{symbol}).
-                    # A symbol-only key means ACK'ing a second signal for the
-                    # SAME symbol under a DIFFERENT mode (e.g. RELIANCE
-                    # GAP_FADE ACK'd, then later RELIANCE MOMENTUM ACK'd)
-                    # would silently overwrite the first position -- its
-                    # exit tracking is lost permanently, since nothing else
-                    # references the old key. Including mode lets both
-                    # positions be tracked independently.
+                    # NOTE: tracked-position key में MODE भी शामिल है,
+                    # सिर्फ़ symbol नहीं (alpha:pos:{symbol}:{mode}, न कि
+                    # alpha:pos:{symbol})। एक symbol-only key का मतलब
+                    # होगा कि एक ही symbol पर DIFFERENT mode में दूसरा
+                    # signal ACK करने पर (जैसे RELIANCE GAP_FADE ACK
+                    # किया, फिर बाद में RELIANCE MOMENTUM ACK किया) पहली
+                    # position चुपचाप overwrite हो जाएगी -- उसका exit
+                    # tracking हमेशा के लिए खो जाएगा, क्योंकि पुरानी key
+                    # को और कुछ reference नहीं करता। Mode include करने
+                    # से दोनों positions independently track हो पाती हैं।
                     await redis_client.setex(
                         f"alpha:pos:{symbol}:{mode}", TRACKED_POSITION_TTL_SECONDS, pending_info)
                     await redis_client.delete(
@@ -1565,17 +1570,18 @@ async def initialize_telegram_bot(redis_client_async):
 
             elif action == "DONE":
                 await redis_client.delete(f"alpha:pos:{symbol}:{mode}")
-                # Re-arm the entry cooldown for this (symbol, mode) on DONE.
-                # Without this, if enough real time has passed since entry
-                # that the original entry cooldown already expired naturally
-                # (e.g. the user held a MOMENTUM position for an hour, but
-                # its cooldown was only 300s), deleting the tracked position
-                # does nothing to prevent re-entry: if the score is STILL
-                # inside the trigger band on the very next tick, a brand-new
-                # entry alert fires immediately for the position the user
-                # just closed. Setting a fresh cooldown gives the user a
-                # deliberate cool-down period after manually closing a trade
-                # before the same (symbol, mode) signal can alert again.
+                # DONE पर इस (symbol, mode) के लिए entry cooldown को फिर
+                # से re-arm कर दो। इसके बिना, अगर entry के बाद इतना असली
+                # समय बीत चुका है कि original entry cooldown naturally
+                # expire हो चुका है (जैसे user ने MOMENTUM position घंटे
+                # भर hold की, पर उसका cooldown सिर्फ़ 300s था), तो tracked
+                # position को delete करने से re-entry नहीं रुकेगी: अगर
+                # score अभी भी trigger band में है, तो बिल्कुल अगले tick
+                # पर उसी position के लिए एक नया entry alert तुरंत fire
+                # हो जाएगा जिसे user ने अभी बंद किया। एक fresh cooldown
+                # set करने से user को manually trade बंद करने के बाद
+                # एक deliberate cool-down period मिल जाता है, तब तक उस
+                # (symbol, mode) signal से दोबारा alert नहीं आएगा।
                 await redis_client.set(
                     f"alpha:cd:{symbol}:{mode}", "1",
                     ex=COOLDOWN_SECONDS_BY_MODE.get(mode, EXIT_ALERT_COOLDOWN_SECONDS))
@@ -1622,8 +1628,9 @@ async def initialize_telegram_bot(redis_client_async):
 
 
 async def shutdown_telegram_bot():
-    """Gracefully stops the Telegram bot's polling updater and shuts down
-    the Application, if one was successfully initialized."""
+    """Telegram bot के polling updater को gracefully रोकता है और
+    Application को shut down करता है, अगर एक successfully initialized
+    हुआ था।"""
     telegram_application = TELEGRAM_BOT_STATE["application"]
     if not telegram_application:
         return
@@ -1636,24 +1643,25 @@ async def shutdown_telegram_bot():
 
 
 def determine_entry_direction(score_data, mode):
-    """Single source of truth for an entry's LONG/SHORT direction. For
-    GAP_FADE, the meaningful direction is the gap's own sign (not the
-    composite score's sign, which can differ). For all other modes, the
-    composite score's sign is the direction. Used both when building the
-    entry alert text AND when persisting the pending position, so the
-    exit alert can later read the SAME direction back reliably instead
-    of re-deriving it from score_at_entry (which is wrong for GAP_FADE,
-    since a gap-fade's score and its trade direction are not always the
-    same sign)."""
+    """किसी entry की LONG/SHORT direction के लिए single source of truth।
+    GAP_FADE के लिए, meaningful direction gap के अपने sign से आती है
+    (composite score के sign से नहीं, जो अलग हो सकता है)। बाकी हर mode
+    के लिए, composite score का sign ही direction है। यह दोनों जगह
+    इस्तेमाल होता है: entry alert text बनाते समय AND pending position
+    को persist करते समय, ताकि बाद में exit alert same direction को
+    reliably वापस पढ़ सके, न कि score_at_entry से re-derive करे (जो
+    GAP_FADE के लिए गलत होगा, क्योंकि gap-fade का score और उसकी trade
+    direction हमेशा एक ही sign की नहीं होतीं)।"""
     if mode == "GAP_FADE":
         return "LONG" if score_data.get("gap", 0.0) > 0 else "SHORT"
     return "LONG" if score_data["score"] > 0 else "SHORT"
 
 
 async def send_entry_alert(redis_client_async, score_data, mode):
-    """Sends (or, if the bot is disabled, prints) an entry alert with
-    ACK/SKIP buttons, and persists the pending alert details in Redis
-    so the ACK handler can look them up later -- even across a restart."""
+    """एक entry alert भेजता है (या bot disabled हो तो print करता है)
+    ACK/SKIP buttons के साथ, और pending alert की details को Redis में
+    persist कर देता है ताकि ACK handler बाद में उन्हें लुक-अप कर सके --
+    restart होने के बाद भी।"""
     alert_text = build_entry_alert_text(score_data, mode)
     telegram_application = TELEGRAM_BOT_STATE["application"]
 
@@ -1683,11 +1691,11 @@ async def send_entry_alert(redis_client_async, score_data, mode):
 
 
 async def send_exit_alert(score_data, tracked_position, displayed_score):
-    """Sends (or, if the bot is disabled, prints) an exit alert with
-    DONE/HOLD MORE buttons for a previously ACK'd position. displayed_score
-    is whichever metric (composite score or gap score) actually decided
-    the exit -- see the caller in broadcaster_loop -- so the message text
-    matches the real trigger instead of always showing the composite score
+    """एक exit alert भेजता है (या bot disabled हो तो print करता है)
+    DONE/HOLD MORE buttons के साथ, किसी पहले ACK'd position के लिए।
+    displayed_score वो metric है (composite score या gap score) जिसने
+    वाकई exit decide किया -- देखें broadcaster_loop में caller -- ताकि
+    message text real trigger से match करे, न कि हमेशा composite score
     even for a GAP_FADE exit that was decided from the gap score."""
     alert_text = build_exit_alert_text(
         score_data["symbol"], tracked_position, displayed_score,
@@ -1708,27 +1716,27 @@ async def send_exit_alert(score_data, tracked_position, displayed_score):
 
 
 async def check_suppression_status(redis_client_async):
-    """Checks all suppression conditions in priority order and returns
-    (is_suppressed, reason_string). The caller is responsible for caching
-    this result for a short interval to avoid hitting Redis/disk on every
-    single incoming score message.
+    """सभी suppression conditions को priority order में check करता है और
+    (is_suppressed, reason_string) return करता है। Caller की ज़िम्मेदारी
+    है कि इस result को कुछ समय के लिए cache करे ताकि हर आने वाले score
+    message पर Redis/disk hit न हो।
 
-    The disk check (os.path.exists) is run via asyncio.to_thread rather
-    than called directly, since it is a synchronous/blocking system call.
-    On a typical /tmp tmpfs this completes in microseconds, so the
-    practical impact is negligible, but calling blocking I/O directly
-    inside an asyncio coroutine is still avoided here as good practice."""
+    disk check (os.path.exists) asyncio.to_thread के जरिए चलता है, सीधे
+    call नहीं होता, क्योंकि यह एक synchronous/blocking system call है।
+    एक typical /tmp tmpfs पर यह microseconds में पूरा होता है, तो
+    practical impact negligible है, पर asyncio coroutine के अंदर blocking
+    I/O सीधे call करना अच्छी practice नहीं है, इसलिए यहाँ avoid किया है।"""
     try:
-        # NOTE: bool(some_string) in Python is True for EVERY non-empty
-        # string, including "0" and "false" -- Redis always returns
-        # strings (or None if the key is absent), never Python booleans.
-        # bool(await redis_client_async.get("alpha:mute")) would therefore
-        # treat a key explicitly set to "0" (intending "not muted") as
-        # muted, which is the opposite of the intended fail-safe OR
-        # semantics documented for this kill switch. Comparing against the
-        # specific string "1" (the value this codebase always writes when
-        # muting) avoids that trap; a key that is absent (None) or set to
-        # anything other than "1" is treated as not-muted.
+        # NOTE: Python में bool(some_string) हर non-empty string के लिए
+        # True होता है, "0" और "false" भी शामिल -- Redis हमेशा strings
+        # return करता है (या None अगर key absent हो), कभी Python booleans
+        # नहीं। bool(await redis_client_async.get("alpha:mute")) इसलिए
+        # एक ऐसी key जो explicit रूप से "0" पर set हो ("not muted" का
+        # मतलब है) को muted के तौर पर treat करेगा, जो इस kill switch के
+        # लिए documented fail-safe OR semantics का उल्टा है। specific
+        # string "1" (जो value यह codebase mute करते समय हमेशा लिखता है)
+        # से compare करने से यह trap टल जाता है; एक key जो absent (None)
+        # हो या "1" के अलावा कुछ भी set हो, not-muted मानी जाती है।
         mute_value = await redis_client_async.get("alpha:mute")
         if mute_value == "1":
             return True, "muted"
@@ -1739,64 +1747,65 @@ async def check_suppression_status(redis_client_async):
         if not await redis_client_async.get("alpha:hb:data"):
             return True, "no_data"
     except Exception:
-        # Redis itself is unreachable. The PREVIOUS behavior here was:
+        # Redis खुद unreachable है। पहले यहाँ यह होता था:
         #   mute_file_exists = await asyncio.to_thread(os.path.exists, MUTE_FILE_PATH)
         #   return mute_file_exists, "muted"
-        # which is a fail-OPEN bug for a safety-critical function: if
-        # Redis is down AND the disk mute file happens not to exist, this
-        # returned (False, "muted") -- meaning "NOT suppressed" -- at
-        # exactly the moment none of the heartbeat checks above (kill
-        # switches #1 and #2: is Process B alive, is data flowing) could
-        # even run, because they all depend on the same unreachable Redis.
-        # Verified via trace: a Redis outage with no disk flag present
-        # silently allowed alerts to keep firing with zero live safety
-        # checks in effect -- the exact opposite of what a kill switch is
-        # for. Fail SAFE instead: treat a Redis outage itself as a
-        # suppression condition (return True unconditionally), and only
-        # use the disk check to report a more specific reason if it's the
-        # thing that's actually set.
+        # जो एक safety-critical function के लिए fail-OPEN bug है: अगर
+        # Redis down है AND disk mute file भी exist नहीं करती, तो यह
+        # (False, "muted") return करता -- मतलब "NOT suppressed" -- ठीक
+        # उसी moment जब ऊपर की heartbeat checks (kill switches #1 और #2:
+        # Process B alive है, data flow हो रहा है) में से कोई भी चल ही
+        # नहीं सकती, क्योंकि वे सब उसी unreachable Redis पर depend करती
+        # हैं। Trace से verified: एक Redis outage जिसमें disk flag भी
+        # न हो, चुपचाप alerts fire होने देता था बिना किसी live safety
+        # check के -- यह ठीक उलटा है जो एक kill switch के लिए चाहिए।
+        # इसकी जगह fail SAFE: Redis outage को खुद एक suppression
+        # condition मानो (unconditionally True return करो), और disk
+        # check का इस्तेमाल सिर्फ़ ज़्यादा specific reason report करने
+        # के लिए करो अगर वो actually set हो।
         mute_file_exists = await asyncio.to_thread(os.path.exists, MUTE_FILE_PATH)
         return True, ("muted" if mute_file_exists else "redis_down")
     return False, ""
 
 
-SCORE_RECEIVE_TIMEOUT_SECONDS = 1.0   # how often the broadcaster loop wakes up even with no data
+SCORE_RECEIVE_TIMEOUT_SECONDS = 1.0   # broadcaster loop बिना data के भी इतनी देर में wake हो जाए
 
 
 async def broadcaster_loop():
-    """Process C's main loop. Consumes scores published by Process B,
-    checks suppression (mute/heartbeats), fires exit alerts for tracked
-    positions whose score has decayed, fires entry alerts for newly
-    qualifying signals (respecting per-signal cooldowns), and periodically
-    prints a summary of counters for observability."""
+    """Process C का main loop। Process B के publish हुए scores को consume
+    करता है, suppression check करता है (mute/heartbeats), tracked
+    positions के लिए exit alerts fire करता है जिनका score decay हो गया,
+    नए qualifying signals के लिए entry alerts fire करता है (per-signal
+    cooldowns respect करते हुए), और observability के लिए समय-समय पर
+    counters का summary print करता है।"""
     zmq_context = zmq.asyncio.Context()
     score_subscriber = zmq_context.socket(zmq.SUB)
     score_subscriber.setsockopt(zmq.RCVHWM, ZMQ_HIGH_WATER_MARK)
     score_subscriber.setsockopt(zmq.SUBSCRIBE, b"")
     score_subscriber.connect(ZMQ_SCORES_ADDRESS)
 
-    # multiprocessing.Process.terminate() sends SIGTERM. Inside an asyncio
-    # event loop, the cleanest way to react to that is an
-    # asyncio-native signal handler that sets a stop Event, so the main
-    # while-loop below can check it and exit through the `finally` block
-    # (which shuts down the Telegram bot cleanly) instead of the process
-    # being killed mid-flight with pending Telegram/Redis I/O abandoned.
+    # multiprocessing.Process.terminate() SIGTERM भेजता है। एक asyncio
+    # event loop के अंदर उसका सबसे साफ़ जवाब है एक asyncio-native signal
+    # handler जो एक stop Event set करे, ताकि नीचे का main while-loop
+    # उसे check करके `finally` block से exit हो (जो Telegram bot को साफ़
+    # तरीक़े से बंद करता है), न कि process को mid-flight kill कर दिया जाए
+    # जब Telegram/Redis I/O pending हो।
     stop_requested = asyncio.Event()
     running_loop = asyncio.get_running_loop()
     try:
         for signal_number in (signal.SIGTERM, signal.SIGINT):
             running_loop.add_signal_handler(signal_number, stop_requested.set)
     except NotImplementedError:
-        # add_signal_handler is unavailable on some platforms (e.g. Windows);
-        # the process will still respond to SIGKILL from the launcher's
-        # force-kill fallback, just without a clean shutdown path.
+        # add_signal_handler कुछ platforms पर उपलब्ध नहीं है (जैसे Windows);
+        # process अभी भी launcher के force-kill fallback से आने वाले
+        # SIGKILL पर react करेगा, बस clean shutdown path नहीं मिलेगा।
         pass
 
     redis_client_async = redis_asyncio.from_url(
         REDIS_URL, decode_responses=True,
         health_check_interval=30, socket_keepalive=True)
 
-    # Process C's own liveness heartbeat (symmetric with Process A and B).
+    # Process C का अपना liveness heartbeat (Process A और B जैसा symmetric)।
     heartbeat_redis_client_sync = redis.from_url(REDIS_URL, decode_responses=True)
     start_heartbeat_thread("C", heartbeat_redis_client_sync)
 
@@ -1814,16 +1823,17 @@ async def broadcaster_loop():
     try:
         while not stop_requested.is_set():
             try:
-                # A plain, unconditional recv_multipart() blocks forever if
-                # Process B stops publishing (market closed, engine down,
-                # etc). While blocked, this loop never reaches the periodic
-                # stats-print check below, so the console goes silent with
-                # no visible indication of "no_data" suppression -- it
-                # looks indistinguishable from a crash. Wrapping the recv in
-                # asyncio.wait_for() means the loop always wakes up at least
-                # once every SCORE_RECEIVE_TIMEOUT_SECONDS even with zero
-                # incoming messages, so stats keep printing and the stop
-                # signal is checked promptly.
+                # एक सादा, unconditional recv_multipart() हमेशा के लिए
+                # block हो जाता है अगर Process B publish करना बंद कर दे
+                # (market closed, engine down, आदि)। जब तक blocked रहेगा,
+                # यह loop नीचे के periodic stats-print check तक कभी नहीं
+                # पहुँचेगा, तो console silent हो जाएगा बिना "no_data"
+                # suppression के किसी visible indication के -- यह देखने
+                # में crash से अलग नहीं होगा। recv को asyncio.wait_for()
+                # में wrap करने का मतलब है कि loop हर SCORE_RECEIVE_TIMEOUT_
+                # SECONDS पर कम से कम एक बार wake हो जाता है, incoming
+                # messages ज़ीरो होने पर भी, तो stats print होते रहते
+                # हैं और stop signal तुरंत check होता है।
                 try:
                     symbol_bytes, message_payload = await asyncio.wait_for(
                         score_subscriber.recv_multipart(),
@@ -1840,7 +1850,7 @@ async def broadcaster_loop():
                 score_data = json.loads(message_payload)
                 stats_counters["scores_received"] += 1
 
-                # Refresh the cached suppression check at most once per second.
+                # cached suppression check को ज़्यादा से ज़्यादा एक second में एक बार refresh करो।
                 current_wall_time = time.time()
                 if current_wall_time - cached_suppression_state["checked_at"] > MUTE_STATUS_CACHE_SECONDS:
                     is_suppressed, suppression_reason = await check_suppression_status(redis_client_async)
@@ -1852,34 +1862,39 @@ async def broadcaster_loop():
                     reason = cached_suppression_state["reason"]
                     stats_counters[reason] = stats_counters.get(reason, 0) + 1
                 else:
-                    # 1) Exit alerts for previously ACK'd positions whose score has
-                    # either decayed back toward zero OR reversed hard against the
-                    # entry direction. Using abs(current_score) <= threshold alone
-                    # is NOT sufficient: if a LONG entry's score reverses sharply
-                    # negative (e.g. +8.5 at entry -> -6.0 on a trend reversal),
-                    # abs(-6.0) = 6.0 is NOT <= 2.0, so a plain-abs check would
-                    # never fire an exit alert even though the position is now
-                    # moving strongly AGAINST the user. The check below fires
-                    # whenever the score has fallen through the LONG exit
-                    # threshold, or risen through the SHORT exit threshold --
-                    # covering both "decayed to flat" and "reversed against us".
+                    # 1) पहले ACK'd positions के लिए exit alerts, जिनका
+                    # score या तो zero की तरफ decay हो गया OR entry
+                    # direction के विरुद्ध जोरदार reverse हो गया। सिर्फ़
+                    # abs(current_score) <= threshold check करना पर्याप्त
+                    # नहीं है: अगर एक LONG entry का score बहुत sharply
+                    # negative हो जाए (जैसे entry पर +8.5 -> trend
+                    # reversal पर -6.0), abs(-6.0) = 6.0 <= 2.0 नहीं है,
+                    # तो plain-abs check कभी exit alert नहीं भेजेगा जबकि
+                    # position अब user के खिलाफ़ जोरदार move कर रही है।
+                    # नीचे का check तब fire होता है जब score LONG के लिए
+                    # exit threshold से गिर जाए, या SHORT के लिए ऊपर
+                    # जाए -- यह दोनों cases cover करता है: "decayed to
+                    # flat" और "reversed against us"।
                     #
-                    # Positions are tracked per (symbol, mode), not per symbol
-                    # alone, so a single symbol can have independently ACK'd
-                    # positions under different modes at the same time (e.g.
-                    # RELIANCE GAP_FADE and RELIANCE MOMENTUM both active).
-                    # Check every mode's tracked-position key for this symbol.
+                    # Positions per (symbol, mode) track होती हैं, सिर्फ़
+                    # per symbol नहीं, इसलिए एक ही symbol पर different
+                    # modes में independent ACK'd positions एक साथ हो
+                    # सकती हैं (जैसे RELIANCE GAP_FADE और RELIANCE
+                    # MOMENTUM दोनों active)। इस symbol के लिए हर mode
+                    # की tracked-position key check करें।
                     #
-                    # modes_with_active_position is also reused below, in the
-                    # entry-alert section (part 2), to SKIP generating a brand
-                    # new entry alert for a mode that already has a position
-                    # being tracked for this symbol. Without this, a position
-                    # held past its (much shorter) entry cooldown -- e.g. a
-                    # MOMENTUM position ACK'd and held for 20 minutes while
-                    # its 300s entry cooldown key naturally expires -- would
-                    # get a completely fresh, duplicate entry alert on the
-                    # very next tick that still qualifies, even though the
-                    # user is still actively holding the original position.
+                    # modes_with_active_position नीचे भी दोबारा इस्तेमाल
+                    # होता है, entry-alert section (part 2) में, ताकि
+                    # किसी mode के लिए brand-new entry alert generate करना
+                    # SKIP कर दिया जाए अगर उसकी पहले से एक position इस
+                    # symbol पर track हो रही है। इसके बिना, एक position
+                    # जो अपने (बहुत छोटे) entry cooldown से ज़्यादा देर तक
+                    # hold की गई हो -- जैसे एक MOMENTUM position ACK
+                    # हुई और 20 मिनट तक hold की गई जबकि उसकी 300s वाली
+                    # entry cooldown key naturally expire हो चुकी हो --
+                    # अगले qualifying tick पर एक बिल्कुल fresh, duplicate
+                    # entry alert मिलेगा, जबकि user अभी भी original
+                    # position hold कर रहा है।
                     modes_with_active_position = set()
                     for candidate_mode in COOLDOWN_SECONDS_BY_MODE:
                         try:
@@ -1899,34 +1914,37 @@ async def broadcaster_loop():
                             "LONG" if tracked_position.get("score_at_entry", 0.0) > 0 else "SHORT")
                         position_mode = tracked_position.get("mode", candidate_mode)
 
-                        # GAP_FADE's direction is derived from the GAP's sign, not
-                        # the composite score's sign (see determine_entry_direction) --
-                        # the two can legitimately disagree (e.g. a bullish gap-fade
-                        # entry can coexist with a bearish composite score from the
-                        # other 8 calculators). So for GAP_FADE we must evaluate the
-                        # exit condition against gap_fade_raw_score (the same metric
-                        # that triggered entry), NOT the composite score. Using the
-                        # composite score here was a real bug: it could cause an
-                        # exit alert to fire on the very next tick after entry,
-                        # because the composite score was never actually inside the
-                        # GAP_FADE entry's trigger range to begin with.
+                        # GAP_FADE की direction GAP के sign से derive होती
+                        # है, composite score के sign से नहीं (देखें
+                        # determine_entry_direction) -- दोनों legitimately
+                        # disagree कर सकती हैं (जैसे एक bullish gap-fade
+                        # entry, बाकी 8 calculators से आने वाले bearish
+                        # composite score के साथ coexist कर सकती है)। तो
+                        # GAP_FADE के लिए हमें exit condition को
+                        # gap_fade_raw_score के मुक़ाबले evaluate करना है
+                        # (वही metric जिसने entry trigger किया), NOT
+                        # composite score। यहाँ composite score इस्तेमाल
+                        # करना एक असली bug था: entry के बिल्कुल अगले
+                        # tick पर एक exit alert fire हो सकता था, क्योंकि
+                        # composite score पहले से GAP_FADE entry के
+                        # trigger range के अंदर था ही नहीं।
                         if position_mode == "GAP_FADE":
-                            # Use gap_unrestricted, NOT gap, here. "gap" is
-                            # the entry-only time-gated metric that
-                            # calculate_gap_fade unconditionally zeroes the
-                            # instant the 9:15-9:30 window ends -- reading
-                            # it here would force-exit every open GAP_FADE
-                            # position at exactly 9:30:00 daily regardless
-                            # of whether the underlying gap had actually
-                            # closed (verified via simulation: entry on a
-                            # real 2.5% gap, price completely unchanged,
-                            # still produced should_exit=True the moment
-                            # the clock passed 9:30:00 using "gap"). The
-                            # window gate makes sense for deciding whether
-                            # a NEW entry should fire; it makes no sense
-                            # for deciding whether an EXISTING position's
-                            # underlying gap has actually closed, which is
-                            # a real-world price fact, not a clock fact.
+                            # यहाँ gap_unrestricted इस्तेमाल करो, NOT gap।
+                            # "gap" entry-only time-gated metric है जिसे
+                            # calculate_gap_fade unconditionally zero कर
+                            # देता है 9:15-9:30 window end होते ही --
+                            # यहाँ उसे पढ़ना हर खुली GAP_FADE position
+                            # को ठीक 9:30:00 पर force-exit कर देगा, चाहे
+                            # underlying gap वाकई close हुआ हो या नहीं
+                            # (simulation से verified: एक असली 2.5% gap
+                            # पर entry, price बिल्कुल unchanged, फिर भी
+                            # जैसे ही clock 9:30:00 पर पहुँचा, "gap"
+                            # इस्तेमाल करने पर should_exit=True हो जाता
+                            # था)। window gate का मतलब है कि क्या NEW
+                            # entry fire होनी चाहिए; इसका मतलब यह नहीं
+                            # है कि क्या EXISTING position का underlying
+                            # gap वाकई close हो गया, जो एक real-world
+                            # price fact है, clock fact नहीं।
                             current_exit_metric = score_data.get("gap_unrestricted", 0.0)
                             if position_direction == "LONG":
                                 should_exit = current_exit_metric <= EXIT_ALERT_SCORE_THRESHOLD
@@ -1943,12 +1961,14 @@ async def broadcaster_loop():
                             try:
                                 if await is_exit_cooldown_expired(
                                         redis_client_async, score_data["symbol"], position_mode):
-                                    # Pass the metric that actually triggered this exit
-                                    # (gap score for GAP_FADE, composite score otherwise)
-                                    # so the Telegram message reports the same number the
-                                    # decision was based on, instead of always showing the
-                                    # composite score even when a GAP_FADE exit was really
-                                    # decided from the gap score.
+                                    # जो metric वाकई इस exit को trigger
+                                    # किया (GAP_FADE के लिए gap score,
+                                    # बाकी के लिए composite score) उसे
+                                    # pass करो, ताकि Telegram message वही
+                                    # number report करे जिस पर decision
+                                    # हुआ, न कि हमेशा composite score
+                                    # दिखाए जब GAP_FADE exit असल में gap
+                                    # score से decide हुआ हो।
                                     await send_exit_alert(
                                         score_data, tracked_position, current_exit_metric)
                                     stats_counters["exit_alerts_sent"] += 1
@@ -1956,46 +1976,48 @@ async def broadcaster_loop():
                                 stats_counters["redis_errors"] += 1
                                 print(f"[C] exit err: {exit_error!r}", flush=True)
 
-                    # 2) Entry alerts for newly qualifying signals.
-                    # No global rate limiting -- this is an advisory system,
-                    # the user decides which alerts to act on. Only a
-                    # per-(symbol, mode) cooldown is applied, to avoid
-                    # sending a duplicate of the SAME signal repeatedly.
+                    # 2) नए qualifying signals के लिए entry alerts।
+                    # कोई global rate limiting नहीं है -- यह एक advisory
+                    # system है, user तय करता है कि किस alert पर action
+                    # लेना है। सिर्फ़ per-(symbol, mode) cooldown लगता है,
+                    # ताकि एक ही signal बार-बार duplicate न भेजा जाए।
                     #
-                    # determine_signal_modes() returns a LIST, not a single
-                    # priority-ordered mode: GAP_FADE is a genuinely distinct
-                    # measurement from MOMENTUM/MEAN_REVERSION (computed from
-                    # gap_fade_raw_score, independently of the composite
-                    # score) and can legitimately co-occur with one of them.
-                    # An earlier version returned only the first match in a
-                    # fixed GAP_FADE > MOMENTUM > MEAN_REVERSION order, which
-                    # meant a modest gap (e.g. 2.1, barely over its own 2.0
-                    # threshold) would silently discard a simultaneously
-                    # qualifying, much stronger MOMENTUM signal -- verified
-                    # via simulation (score=9.5, rvol=5.0, gap=2.1 returned
-                    # only "GAP_FADE"). Iterating every qualifying mode here
-                    # and evaluating each one's cooldown/tracked-position
-                    # state independently fixes that without discarding
-                    # anything, since the rest of this codebase (cooldown
-                    # keys, tracked-position keys, exit-alert loop above)
-                    # already keys everything by (symbol, mode).
+                    # determine_signal_modes() एक LIST return करता है, न
+                    # कि single priority-ordered mode: GAP_FADE MOMENTUM/
+                    # MEAN_REVERSION से genuinely distinct measurement है
+                    # (gap_fade_raw_score से compute होता है, composite
+                    # score से independent) और उनमें से किसी के साथ
+                    # legitimately co-occur कर सकता है। एक पुराने version
+                    # ने पहले match पर fixed GAP_FADE > MOMENTUM >
+                    # MEAN_REVERSION order में सिर्फ़ पहला return किया था,
+                    # जिसका मतलब है कि एक modest gap (जैसे 2.1, बस 2.0
+                    # threshold से थोड़ा ऊपर) एक साथ हो रहे बहुत strong
+                    # MOMENTUM signal को चुपचाप discard कर देता था --
+                    # simulation से verified (score=9.5, rvol=5.0, gap=2.1
+                    # पर सिर्फ़ "GAP_FADE" return हुआ)। यहाँ हर qualifying
+                    # mode पर iterate करके, हर एक की cooldown/tracked-
+                    # position state independently evaluate करना इसे बिना
+                    # कुछ discard किए fix कर देता है, क्योंकि बाकी इस
+                    # codebase में (cooldown keys, tracked-position keys,
+                    # ऊपर वाला exit-alert loop) पहले से सब कुछ (symbol,
+                    # mode) से key करता है।
                     qualifying_modes = determine_signal_modes(
                         score_data["score"], score_data["relative_volume"],
                         score_data.get("gap", 0.0))
                     if not qualifying_modes:
                         stats_counters["no_qualifying_mode"] += 1
                     for signal_mode in qualifying_modes:
-                        # Skip entry generation entirely if this (symbol,
-                        # mode) already has an actively tracked position --
-                        # see modes_with_active_position above. The entry
-                        # cooldown alone is NOT sufficient for this: it is
-                        # purely time-based (e.g. 300s for MOMENTUM) and has
-                        # no awareness of whether the position is still
-                        # open, so a position held longer than its own
-                        # cooldown window would otherwise get a duplicate,
-                        # unsolicited fresh entry alert on the next
-                        # qualifying tick despite the user still holding
-                        # the original one.
+                        # अगर इस (symbol, mode) की पहले से actively tracked
+                        # position है, तो entry generation पूरी तरह skip
+                        # कर दो -- ऊपर modes_with_active_position देखें।
+                        # अकेला entry cooldown इसके लिए काफ़ी नहीं है: वो
+                        # पूरी तरह time-based है (जैसे MOMENTUM के लिए
+                        # 300s) और उसे यह पता नहीं होता कि position अभी
+                        # open है या नहीं, तो एक position जो अपने cooldown
+                        # window से ज़्यादा देर hold की गई हो, अगले
+                        # qualifying tick पर एक duplicate, unsolicited
+                        # fresh entry alert पा जाती, भले ही user अभी भी
+                        # original hold कर रहा हो।
                         if signal_mode in modes_with_active_position:
                             stats_counters["position_already_tracked"] = (
                                 stats_counters.get("position_already_tracked", 0) + 1)
@@ -2023,44 +2045,46 @@ async def broadcaster_loop():
                 raise
             except Exception as loop_error:
                 print(f"[C] loop err: {loop_error!r}", flush=True)
-                await asyncio.sleep(0.1)   # avoid a tight error loop
+                await asyncio.sleep(0.1)   # tight error loop से बचाव
     finally:
         await shutdown_telegram_bot()
-        # Explicitly close the async Redis connection pool and terminate
-        # the ZMQ context. Without this, redis.asyncio leaves its
-        # connection pool's underlying sockets open until Python's
-        # garbage collector eventually finalizes the client (which for a
-        # process that's exiting right after this point may never happen
-        # cleanly), producing a "Unclosed client session" / "Unclosed
-        # connector" warning on stderr.
+        # async Redis connection pool को explicitly close करो और ZMQ
+        # context को terminate करो। इसके बिना, redis.asyncio अपने
+        # connection pool की underlying sockets को open छोड़ देता है जब
+        # तक Python का garbage collector client को finalize न कर दे (जो
+        # एक ऐसे process के लिए जो इस point के बाद तुरंत exit हो रहा है,
+        # कभी cleanly नहीं हो सकता), और stderr पर "Unclosed client
+        # session" / "Unclosed connector" warning आएगी।
         try:
             await redis_client_async.aclose()
         except Exception as redis_close_error:
             print(f"[C] redis close err: {redis_close_error!r}", flush=True)
 
-        # CRITICAL ordering requirement: zmq_context.term() blocks
-        # (hangs forever) until every socket created from that context has
-        # been closed. score_subscriber was never explicitly closed before
-        # this term() call was added in a prior commit -- it relied on the
-        # socket eventually being garbage-collected, which term() does NOT
-        # wait for reliably in all pyzmq versions. Without an explicit
-        # close() first, term() could block indefinitely, and the launcher
-        # would only recover via its 5-second SIGKILL fallback -- meaning
-        # this process never actually shuts down gracefully, defeating the
-        # entire purpose of adding term() in the first place. Close the
-        # socket FIRST, then terminate the context.
+        # CRITICAL ordering requirement: zmq_context.term() तब तक block
+        # करता है (हमेशा के लिए hang) जब तक उस context से बनी हर socket
+        # close नहीं हो जाती। score_subscriber को इस term() call से पहले
+        # कभी explicitly close नहीं किया गया था (यह एक पिछले commit में
+        # जोड़ा गया था) -- यह socket के eventually garbage-collect होने
+        # पर निर्भर था, जिसका term() सारे pyzmq versions में reliably
+        # wait नहीं करता। पहले एक explicit close() के बिना, term()
+        # indefinitely block हो सकता है, और launcher सिर्फ़ अपने 5-second
+        # SIGKILL fallback से recover होगा -- मतलब यह process कभी
+        # gracefully shutdown नहीं होगा, term() add करने का पूरा उद्देश्य
+        # हरा जाएगा। इसलिए पहले socket को close करो, फिर context को
+        # terminate करो।
         #
-        # LINGER=0 before close(): default LINGER=-1 (infinite) means
-        # close() itself can block waiting to flush any buffered-but-
-        # unsent messages, which -- combined with term() blocking until
-        # every socket is closed -- reintroduces exactly the kind of
-        # shutdown hang this close-before-term ordering was written to
-        # prevent. score_subscriber is a SUB socket (it only receives, via
-        # zmq.SUBSCRIBE), so its own outbound buffer is normally just the
-        # subscription-filter handshake, but setting LINGER=0 here removes
-        # any possibility of a hang regardless of pyzmq/libzmq version
-        # internals, at zero behavioral cost during a shutdown that is
-        # discarding this socket anyway.
+        # close() से पहले LINGER=0: default LINGER=-1 (infinite) का मतलब
+        # है कि close() खुद block हो सकता है किसी buffered-but-unsent
+        # messages को flush करने के इंतज़ार में, जो -- term() के हर socket
+        # close होने तक block करने के साथ मिलकर -- ठीक उसी तरह का
+        # shutdown hang दोबारा introduce कर देगा जिसे यह close-before-
+        # term ordering रोकने के लिए लिखी गई थी। score_subscriber एक SUB
+        # socket है (सिर्फ़ receive करता है, zmq.SUBSCRIBE के जरिए), तो
+        # इसका खुद का outbound buffer normally सिर्फ़ subscription-filter
+        # handshake तक limited होता है, पर यहाँ LINGER=0 set करने से
+        # किसी भी pyzmq/libzmq version internals में hang होने की
+        # possibility खत्म हो जाती है, zero behavioral cost पर, क्योंकि
+        # shutdown में यह socket वैसे भी discard हो रही है।
         try:
             score_subscriber.setsockopt(zmq.LINGER, 0)
         except Exception:
@@ -2076,16 +2100,18 @@ async def broadcaster_loop():
 
 
 def run_broadcaster_process():
-    """Entry point wrapper so Process C can run the async broadcaster_loop
-    inside multiprocessing.Process (which expects a plain sync callable)."""
+    """एक entry point wrapper ताकि Process C async broadcaster_loop को
+    multiprocessing.Process के अंदर चला सके (जो एक plain sync callable
+    की उम्मीद करता है)।"""
     asyncio.run(broadcaster_loop())
 
 
 # ============================================================
 # LAUNCHER: self-healing (auto-respawn) + graceful shutdown
+# तीनों processes को शुरू/बंद/restart करने वाला हिस्सा
 # ============================================================
-# Derive the raw filesystem paths from the ipc:// URIs so the cleanup
-# logic below doesn't have to hardcode them a second time.
+# ipc:// URIs से raw filesystem paths derive करो ताकि नीचे का cleanup
+# logic उन्हें दोबारा hardcode न करे।
 IPC_SOCKET_FILE_PATHS = [
     address[len("ipc://"):]
     for address in (ZMQ_TICKS_ADDRESS, ZMQ_SCORES_ADDRESS)
@@ -2096,11 +2122,11 @@ RESTART_COUNTING_WINDOW_SECONDS = 3600
 
 
 def cleanup_ipc_socket_files():
-    """Removes stale ZMQ ipc:// socket files. This is required because
-    UNIX domain sockets are files on disk that are NOT automatically
-    removed by the kernel when a process dies without closing them
-    cleanly (e.g. via SIGKILL) -- the next bind() attempt on the same
-    path would otherwise fail with 'Address already in use'."""
+    """Stale ZMQ ipc:// socket files को हटाता है। यह ज़रूरी है क्योंकि
+    UNIX domain sockets असल में disk पर files होती हैं जिन्हें kernel
+    तब automatically remove नहीं करता जब कोई process बिना उन्हें
+    cleanly close किए मर जाए (जैसे SIGKILL से) -- ऐसे में उसी path पर
+    अगली bind() attempt "Address already in use" error देगी।"""
     for socket_path in IPC_SOCKET_FILE_PATHS:
         try:
             if os.path.exists(socket_path):
@@ -2111,8 +2137,8 @@ def cleanup_ipc_socket_files():
 
 
 def spawn_all_processes():
-    """Creates and starts fresh Process objects for A, B, and C, and
-    returns the list of process handles."""
+    """A, B, और C के लिए fresh Process objects बनाकर start करता है, और
+    process handles की list return करता है।"""
     process_list = [
         Process(target=data_factory,           name="A-DataFactory"),
         Process(target=alpha_engine,           name="B-AlphaEngine"),
@@ -2124,10 +2150,10 @@ def spawn_all_processes():
 
 
 def shutdown_all_processes(process_list, shutdown_reason):
-    """Gracefully terminates every process in process_list: sends
-    SIGTERM, waits up to 5 seconds total for all of them to exit, then
-    force-kills (SIGKILL) any stragglers. Finally cleans up any leftover
-    ZMQ ipc socket files."""
+    """process_list में हर process को gracefully terminate करता है:
+    SIGTERM भेजता है, सारे processes के exit होने के लिए 5 seconds तक
+    wait करता है, फिर बाक़ी बचे stragglers को SIGKILL से force-kill
+    करता है। अंत में कोई भी leftover ZMQ ipc socket files साफ़ करता है।"""
     print(f"\n[launcher] shutdown: {shutdown_reason}", flush=True)
     for process in process_list:
         if process.is_alive():
@@ -2148,14 +2174,14 @@ def shutdown_all_processes(process_list, shutdown_reason):
 
 
 if __name__ == "__main__":
-    cleanup_ipc_socket_files()   # defensive: clear sockets left behind by a prior ungraceful exit
+    cleanup_ipc_socket_files()   # defensive: पिछले ungraceful exit से बची sockets clear करो
     running_processes = spawn_all_processes()
 
     stop_event = threading.Event()
     for signal_number in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signal_number, lambda *_args: stop_event.set())
 
-    recent_restart_timestamps = deque()   # crash-loop breaker: timestamps of recent restarts
+    recent_restart_timestamps = deque()   # crash-loop breaker: recent restarts के timestamps
 
     try:
         while not stop_event.is_set():
@@ -2165,13 +2191,14 @@ if __name__ == "__main__":
                 exit_codes_by_process_name = {
                     process.name: process.exitcode for process in dead_processes}
 
-                # EXIT_CODE_FATAL_CONFIG means a process hit a non-retryable
-                # error (missing/invalid .env credentials, bad TOTP secret,
-                # Angel login rejected, etc). Respawning would just repeat
-                # the exact same failure until the crash-loop breaker trips
-                # anyway, burning ~2 minutes and cluttering the log with
-                # identical error messages for a problem that only a human
-                # editing .env can fix. Stop immediately instead.
+                # EXIT_CODE_FATAL_CONFIG का मतलब है कि एक process एक
+                # non-retryable error से hit हुआ (missing/invalid .env
+                # credentials, bad TOTP secret, Angel login rejected,
+                # आदि)। Respawn करने से बस वही failure repeat होगा जब तक
+                # crash-loop breaker trip नहीं हो जाता, ~2 मिनट बर्बाद
+                # होंगे और log identical error messages से भर जाएगा एक
+                # ऐसी problem के लिए जो सिर्फ़ इंसान के .env edit करने
+                # से ठीक होगी। इसलिए तुरंत रुक जाओ।
                 has_fatal_config_error = any(
                     code == EXIT_CODE_FATAL_CONFIG for code in exit_codes_by_process_name.values())
                 if has_fatal_config_error:
@@ -2183,8 +2210,8 @@ if __name__ == "__main__":
                           "-- not retrying automatically.", flush=True)
                     sys.exit(1)
 
-                # Exit code 2 is our own signal for "planned restart" (e.g. the
-                # scheduled JWT-refresh self-exit in data_factory).
+                # Exit code 2 हमारा अपना "planned restart" signal है (जैसे
+                # data_factory का scheduled JWT-refresh self-exit)।
                 is_planned_restart = any(
                     code == EXIT_CODE_PLANNED_RESTART for code in exit_codes_by_process_name.values())
                 shutdown_reason = ("planned restart (JWT refresh)" if is_planned_restart
@@ -2205,7 +2232,7 @@ if __name__ == "__main__":
                     sys.exit(1)
 
                 print("[launcher] respawning all processes...", flush=True)
-                time.sleep(2)   # brief pause to avoid a tight crash loop
+                time.sleep(2)   # tight crash loop से बचाव के लिए short pause
                 running_processes = spawn_all_processes()
                 continue
 

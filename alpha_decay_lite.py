@@ -93,6 +93,12 @@ RESET_DROP_FRACTION_THRESHOLD = 0.5   # a >50% drop in cumulative volume is trea
                                        # out-of-order packet (reject) -- see update_rolling_windows
 PEAK_SCORE_HALF_LIFE_SECONDS = 60.0  # how fast the "peak score" amplitude decays over time
 AUTO_RESTART_AFTER_HOURS = float(os.getenv("AUTO_RESTART_HOURS", "20"))  # < Angel JWT ~24-28h expiry
+TICK_STARVATION_WATCHDOG_SECONDS = 90   # see check_data_is_flowing/watchdog thread in data_factory:
+                                         # if no tick arrives for this long WHILE THE MARKET IS OPEN,
+                                         # force-exit Process A so the launcher respawns it -- guards
+                                         # against a "zombie" half-open TCP connection (server never
+                                         # sends a FIN/RST, so the SDK's blocking connect() call never
+                                         # returns and the process looks "alive" to the OS forever).
 
 # Process exit codes the launcher inspects to decide how to react.
 # 0 (a bare `return`) and any other unrecognized code are treated as an
@@ -117,6 +123,29 @@ PENDING_ALERT_TTL_SECONDS    = 24 * 3600  # how long an un-ACK'd alert stays act
 def clip_value(value, minimum, maximum):
     """Clamp value into the inclusive range [minimum, maximum]."""
     return max(minimum, min(maximum, value))
+
+
+def is_within_trading_hours(timestamp):
+    """True for NSE's continuous-trading equity session: weekdays,
+    09:15:00-15:30:00 IST. Deliberately does NOT know about exchange
+    holidays (a static holiday-calendar table would need yearly upkeep,
+    and the practical cost of treating a holiday as 'market closed but
+    watchdog stays quiet anyway' is zero, since no ticks would arrive on
+    a holiday regardless). Used by data_factory's tick-starvation
+    watchdog: without this check, the watchdog would misinterpret every
+    single overnight/weekend silence -- when Angel's feed legitimately
+    sends zero ticks for hours -- as a zombie connection, force-exiting
+    Process A over and over outside trading hours and very likely
+    tripping the launcher's crash-loop breaker (which then calls
+    sys.exit(1) and shuts down the ENTIRE system, Process B and C
+    included, not just A)."""
+    local_time = time.localtime(timestamp)
+    if local_time.tm_wday >= 5:   # Saturday=5, Sunday=6
+        return False
+    hour, minute = local_time.tm_hour, local_time.tm_min
+    after_open = (hour > 9) or (hour == 9 and minute >= 15)
+    before_close = (hour < 15) or (hour == 15 and minute <= 30)
+    return after_open and before_close
 
 
 # ============================================================
@@ -294,6 +323,58 @@ def data_factory():
         return "data", seconds_since_last_tick < DATA_FLOW_HEARTBEAT_TTL_SECONDS
 
     start_heartbeat_thread("A", heartbeat_redis_client, additional_check=check_data_is_flowing)
+
+    # Tick-starvation watchdog: guards against a "zombie" half-open TCP
+    # connection. websocket_client.connect() below is a BLOCKING call that
+    # occupies this process's only thread until close_connection() is
+    # called or the underlying socket errors out. If the network silently
+    # drops the connection WITHOUT either side sending a TCP FIN/RST (a
+    # real, fairly common failure mode on some cloud/VPS network paths),
+    # neither on_close nor on_error ever fires -- the SDK has no way to
+    # know the connection is dead, so connect() simply never returns and
+    # this process sits there forever, still fully "alive" from the OS's
+    # point of view (it has a live PID, is not crashed, is not zombied in
+    # the OS sense). The launcher's respawn logic ONLY reacts to
+    # process.is_alive() becoming False, so a hung-but-alive process A is
+    # invisible to it -- kill switch #1 (alpha:hb:data) will correctly
+    # detect and suppress alerts once the heartbeat TTL expires, but
+    # nothing today would ever force this process to actually restart and
+    # recover; it would stay silently muted until a human noticed and
+    # restarted it manually (or, at best, the scheduled ~20h JWT-refresh
+    # restart eventually cycles it).
+    #
+    # This background thread independently monitors last_tick_received_at
+    # and calls os._exit(EXIT_CODE_PLANNED_RESTART) if ticks have stopped
+    # for longer than TICK_STARVATION_WATCHDOG_SECONDS -- but ONLY while
+    # is_within_trading_hours() says the market should actually be sending
+    # ticks right now. Without that market-hours gate, this same watchdog
+    # would misfire every single night and every weekend (when zero ticks
+    # is completely normal), forcing Process A through repeated pointless
+    # Angel re-logins and very likely tripping the launcher's crash-loop
+    # breaker -- which calls sys.exit(1) and shuts down the ENTIRE system
+    # (Process B and C too), a far worse outcome than the zombie-connection
+    # bug this watchdog exists to fix. Using os._exit() (not sys.exit())
+    # matches the JWT-refresh restart directly above: a clean return here
+    # is not possible since the blocking connect() call never gives control
+    # back to this thread's caller, so there is no orderly code path to
+    # unwind through -- the launcher's respawn on process death is the
+    # actual recovery mechanism, same as it already is for the JWT case.
+    def watch_for_tick_starvation():
+        while True:
+            time.sleep(15)
+            now = time.time()
+            if not is_within_trading_hours(now):
+                continue
+            seconds_since_last_tick = now - last_tick_received_at["timestamp"]
+            if (last_tick_received_at["timestamp"] > 0
+                    and seconds_since_last_tick > TICK_STARVATION_WATCHDOG_SECONDS):
+                print(f"[A] WATCHDOG: no tick in {seconds_since_last_tick:.0f}s during "
+                      f"market hours (possible zombie connection) -- forcing restart",
+                      flush=True)
+                os._exit(EXIT_CODE_PLANNED_RESTART)
+
+    watchdog_thread = threading.Thread(target=watch_for_tick_starvation, daemon=True)
+    watchdog_thread.start()
 
     # The SDK's default max_retry_attempt=1 means only one reconnect attempt
     # before giving up entirely. Bump these so transient network hiccups
@@ -568,26 +649,59 @@ def calculate_spread_ratio(_symbol_state, tick_data):
     return 1.0   # treat missing quote data as "spread too wide" (fail safe)
 
 
-def calculate_gap_fade(_symbol_state, tick_data):
-    """Calculator #7: gap-fade signal, active only in the 9:15:00-9:29:59
-    IST window. Returns the negated percentage gap between the day's open
-    and the previous close, so a positive result means 'fade the gap by
-    going long' and a negative result means 'fade by going short'."""
-    local_time = time.localtime(tick_data["timestamp"])
-    is_within_gap_window = (local_time.tm_hour == 9
-                            and 15 <= local_time.tm_min < 30)
-    # NOTE: previous_close_price was already checked for truthiness (it's
-    # the divisor below), but open_price was NOT -- if the feed hasn't
-    # populated open_price yet (0/missing, e.g. on the very first ticks of
-    # the day before the exchange has published an official open), the
-    # formula below computes (0 - previous_close_price) / previous_close_price,
-    # an artificial -100% "gap" that clips to +3.0 and can spuriously
-    # trigger a bullish GAP_FADE alert with no real gap having occurred.
-    if not is_within_gap_window or not tick_data["previous_close_price"] or not tick_data["open_price"]:
+def calculate_gap_fade_unrestricted(tick_data):
+    """The core gap-fade formula, with NO time-of-day gating. Returns the
+    negated percentage gap between the day's open and the previous close,
+    so a positive result means 'fade the gap by going long' and a
+    negative result means 'fade by going short'. Used for two different
+    purposes with two different needs:
+      1. calculate_gap_fade() below wraps this with the entry-only
+         9:15:00-9:29:59 IST time gate, for deciding NEW GAP_FADE entries.
+      2. broadcaster_loop's exit check for an ALREADY-TRACKED GAP_FADE
+         position reads gap_fade_raw_score_unrestricted from the score
+         payload directly (see alpha_engine's publish step) instead of
+         the time-gated value, specifically so the exit decision isn't
+         driven by the clock. Before this split, both entry AND exit used
+         the same time-gated calculate_gap_fade() output, which zeroes
+         out unconditionally the instant the 9:15-9:30 window ends --
+         meaning any open GAP_FADE position got force-exited at exactly
+         9:30:00 every single day regardless of whether the underlying
+         gap had actually closed at all (verified via simulation: a
+         position entered on a genuine 2.5% gap, held with the price
+         completely unchanged, still triggered should_exit=True the
+         moment the clock hit 9:30:00)."""
+    if not tick_data["previous_close_price"] or not tick_data["open_price"]:
+        # previous_close_price is checked here because it's this formula's
+        # divisor; open_price is checked too because if the feed hasn't
+        # populated it yet (0/missing, e.g. the very first ticks of the
+        # day before the exchange has published an official open), the
+        # formula below would compute (0 - previous_close_price) /
+        # previous_close_price, an artificial -100% "gap" that clips to
+        # +3.0 and can spuriously look like a real, large gap with no
+        # actual gap having occurred.
         return 0.0
     gap_percent = ((tick_data["open_price"] - tick_data["previous_close_price"])
                    / tick_data["previous_close_price"]) * 100
     return clip_value(-gap_percent, -3.0, 3.0)
+
+
+def calculate_gap_fade(_symbol_state, tick_data):
+    """Calculator #7: gap-fade signal, active only in the 9:15:00-9:29:59
+    IST window (per this system's design contract -- see module docstring
+    / README's Signal Modes table: 'Gap (9:15-9:30 window only)'). This
+    is the ENTRY-side gate: it feeds compute_feature_score's composite
+    score and determine_signal_modes' GAP_FADE qualification, both of
+    which should only ever trigger a NEW entry inside this window. It
+    deliberately returns 0.0 outside the window rather than the
+    unrestricted value -- see calculate_gap_fade_unrestricted above for
+    why the EXIT path needs a different (non-zeroed-by-the-clock) metric
+    instead of reusing this function's output."""
+    local_time = time.localtime(tick_data["timestamp"])
+    is_within_gap_window = (local_time.tm_hour == 9
+                            and 15 <= local_time.tm_min < 30)
+    if not is_within_gap_window:
+        return 0.0
+    return calculate_gap_fade_unrestricted(tick_data)
 
 
 def calculate_session_weight(_symbol_state, tick_data):
@@ -616,21 +730,34 @@ def calculate_session_weight(_symbol_state, tick_data):
 def compute_feature_score(symbol_state, tick_data):
     """Runs all 9 calculators and combines them into one composite score
     in the range [-10, +10]. Returns (composite_score, relative_volume,
-    gap_fade_raw_score) -- the latter two are needed downstream by
-    Process C's mode-selection logic."""
+    gap_fade_raw_score, gap_fade_raw_score_unrestricted):
+      - gap_fade_raw_score is the ENTRY-gated value (zeroed outside
+        9:15-9:30 IST), used for the composite score itself and for
+        determine_signal_modes' GAP_FADE entry qualification.
+      - gap_fade_raw_score_unrestricted is the same underlying gap
+        measurement WITHOUT the time gate, published separately so
+        broadcaster_loop's exit check for an already-open GAP_FADE
+        position can use a metric that doesn't get artificially zeroed
+        the instant the clock passes 9:30:00 -- see
+        calculate_gap_fade_unrestricted's docstring for the false-exit
+        bug this specifically fixes."""
     relative_volume = calculate_relative_volume(symbol_state, tick_data)
 
     spread_ratio = calculate_spread_ratio(symbol_state, tick_data)
     if spread_ratio > SPREAD_RATIO_MAX:
         # Spread too wide to trust this quote -- gate the score to zero,
-        # but still return the real relative_volume (it's independently useful).
-        return 0.0, relative_volume, 0.0
+        # but still return the real relative_volume (it's independently
+        # useful) and the unrestricted gap metric (an exit check for an
+        # existing position must not be blinded by a single wide-spread
+        # tick either).
+        return 0.0, relative_volume, 0.0, calculate_gap_fade_unrestricted(tick_data)
 
     vwap_distance_score      = calculate_vwap_distance(symbol_state, tick_data)
     aggressive_buy_score     = calculate_aggressive_buy_pressure(symbol_state, tick_data)
     absorption_score         = calculate_absorption(symbol_state, tick_data)
     book_imbalance_score     = calculate_book_imbalance(symbol_state, tick_data)
     gap_fade_raw_score       = calculate_gap_fade(symbol_state, tick_data)
+    gap_fade_raw_score_unrestricted = calculate_gap_fade_unrestricted(tick_data)
     session_weight           = calculate_session_weight(symbol_state, tick_data)
 
     # Combine aggressive-buy and absorption: if they agree in sign, dampen
@@ -648,7 +775,7 @@ def compute_feature_score(symbol_state, tick_data):
                           + 1.5 * book_imbalance_score
                           + 1.0 * gap_fade_raw_score),
         -10.0, 10.0)
-    return composite_score, relative_volume, gap_fade_raw_score
+    return composite_score, relative_volume, gap_fade_raw_score, gap_fade_raw_score_unrestricted
 
 
 def classify_trade_direction(tick_data, previous_last_traded_price):
@@ -767,10 +894,29 @@ def update_rolling_windows(symbol_state, tick_data):
     symbol_state.aggressive_absolute_volume_30s.add(current_timestamp, absolute_volume_contribution)
 
     price_history = symbol_state.last_traded_price_history_30s
-    price_history.append((current_timestamp, tick_data["last_traded_price"]))
-    price_history_cutoff = current_timestamp - 30
-    while price_history and price_history[0][0] < price_history_cutoff:
-        price_history.popleft()
+    # An out-of-order/delayed tick (network jitter, WS reconnect replay) can
+    # have a timestamp OLDER than the newest entry already at the back of
+    # this deque. Appending it there anyway would break the deque's
+    # chronological ordering invariant -- and calculate_absorption's min/max
+    # price lookup (and the eviction loop right below, which only ever
+    # checks the FRONT of the deque) both silently assume that invariant
+    # holds. A stale entry appended out of order can end up buried behind
+    # newer entries and survive well past its own 30-second window, since
+    # front-only eviction never reaches it until everything appended before
+    # it (chronologically after it, but earlier in arrival order) has aged
+    # out first. Verified via simulation: an out-of-order tick with an
+    # anomalous price corrupted this window's min/max for the absorption
+    # calculator's price_range_ratio for multiple ticks after it should
+    # have already expired. Rejecting (not appending) any tick older than
+    # the current back of the deque keeps the chronological invariant
+    # intact -- this is the same "reject the out-of-order sample" approach
+    # already used for the cumulative-volume watermark elsewhere in this
+    # file, applied here for the same underlying reason.
+    if not price_history or current_timestamp >= price_history[-1][0]:
+        price_history.append((current_timestamp, tick_data["last_traded_price"]))
+        price_history_cutoff = current_timestamp - 30
+        while price_history and price_history[0][0] < price_history_cutoff:
+            price_history.popleft()
 
 
 def alpha_engine():
@@ -848,14 +994,37 @@ def alpha_engine():
             symbol_state = symbol_state_by_symbol[symbol] = SymbolState()
 
         update_rolling_windows(symbol_state, tick_data)
-        raw_composite_score, relative_volume, gap_fade_raw_score = compute_feature_score(
-            symbol_state, tick_data)
+        (raw_composite_score, relative_volume, gap_fade_raw_score,
+         gap_fade_raw_score_unrestricted) = compute_feature_score(symbol_state, tick_data)
 
         # --- Calculator #9: EMA smoother, plus time-based peak-amplitude decay ---
         if symbol_state.last_tick_timestamp == 0:
-            # First tick ever for this symbol: initialize directly, no smoothing yet.
+            # First tick ever for this symbol: initialize the EMA directly
+            # (there's no prior smoothed value to blend with yet, so
+            # smoothed == raw on this one tick is unavoidable). But
+            # peak_score_amplitude is seeded at 0.0, NOT abs(raw_composite_
+            # score) -- market-open ticks are frequently anomalous
+            # (illiquid opening quotes, a stale/wide first snap-quote
+            # before real two-sided trading starts), and this system's
+            # peak field is broadcast directly in every Telegram alert
+            # ("peak=X.XX") as if it reflects genuinely sustained momentum.
+            # Seeding it from a single unsmoothed first sample let one bad
+            # opening tick (e.g. a spurious +10.0) broadcast a misleadingly
+            # high peak for well over a minute afterward even after the
+            # smoothed score itself had already settled back down to a
+            # normal value within a few seconds (verified via simulation:
+            # a single outlier first tick of 10.0 followed by genuine
+            # steady ticks of 1.0 kept peak >= 5.0 for a full 60 seconds
+            # under the old seed-from-raw behavior). Seeding at 0.0 instead
+            # lets the very next line's normal max(decayed_peak,
+            # abs(smoothed_ema_score)) logic build the peak up from
+            # genuinely-observed (already-smoothed) values only, on every
+            # tick including this first one's smoothed value on the tick
+            # after it -- so a real, sustained move still reaches its true
+            # peak almost immediately, while a single-tick anomaly no
+            # longer gets a full minute of decay time to work off.
             symbol_state.smoothed_ema_score = raw_composite_score
-            symbol_state.peak_score_amplitude = abs(raw_composite_score)
+            symbol_state.peak_score_amplitude = 0.0
         elif tick_data["timestamp"] > symbol_state.last_tick_timestamp:
             delta_time_seconds = tick_data["timestamp"] - symbol_state.last_tick_timestamp
             ema_alpha = 1.0 - math.exp(-delta_time_seconds / EMA_TIME_CONSTANT_SECONDS)
@@ -895,6 +1064,15 @@ def alpha_engine():
             "peak": symbol_state.peak_score_amplitude,
             "relative_volume": relative_volume,
             "gap": gap_fade_raw_score,
+            # gap_unrestricted: the SAME gap measurement as "gap" above,
+            # but WITHOUT the 9:15-9:30 entry-only time gate. broadcaster_
+            # loop's exit check for an already-tracked GAP_FADE position
+            # uses THIS field, not "gap" -- using the time-gated "gap"
+            # value there was a real bug: it unconditionally zeroes out
+            # the moment the window ends, which forced a false exit alert
+            # for every open GAP_FADE position at exactly 9:30:00 daily,
+            # regardless of whether the underlying gap had actually closed.
+            "gap_unrestricted": gap_fade_raw_score_unrestricted,
             "last_traded_price": tick_data["last_traded_price"],
             "timestamp": tick_data["timestamp"],
         }).encode()])
@@ -959,7 +1137,11 @@ def determine_signal_modes(composite_score, relative_volume, gap_fade_raw_score=
        GAP_FADE       : |gap_fade_raw_score| >= 2.0
                          (only nonzero 9:15-9:30 IST, via calculate_gap_fade's gating)
        MOMENTUM       : |composite_score| >= 8 and relative_volume >= 1.5
-       MEAN_REVERSION : 3 <= |composite_score| < 8 and relative_volume < 2.0
+       MEAN_REVERSION : |composite_score| >= 3 and relative_volume < 2.0,
+                        AND MOMENTUM did not already match (mutually exclusive
+                        with it via elif, not via an upper score bound --
+                        see the inline note below for why the upper bound
+                        was removed)
 
     Returns a LIST of every mode that independently qualifies, NOT a
     single priority-ordered choice. An earlier version of this function
@@ -990,7 +1172,23 @@ def determine_signal_modes(composite_score, relative_volume, gap_fade_raw_score=
     absolute_score = abs(composite_score)
     if absolute_score >= 8 and relative_volume >= 1.5:
         qualifying_modes.append("MOMENTUM")
-    elif 3 <= absolute_score < 8 and relative_volume < 2.0:
+    # NOTE: this used to be `elif 3 <= absolute_score < 8 and relative_volume
+    # < 2.0`, which created a "dead zone": a score of e.g. 9.5 (well above
+    # MOMENTUM's own >=8 threshold) with relative_volume=1.2 (just below
+    # MOMENTUM's >=1.5 volume requirement) failed BOTH branches -- it missed
+    # MOMENTUM on volume, and missed MEAN_REVERSION too because its upper
+    # bound of "< 8" excluded any score that high. The signal was silently
+    # dropped entirely despite an unusually strong price move, exactly the
+    # kind of low-volume/high-score situation (e.g. spoofing, an illiquid
+    # circuit-adjacent move) this system should NOT go blind on. Verified
+    # via simulation: composite_score=9.5, relative_volume=1.2 returned []
+    # under the old condition. Dropping the "< 8" upper bound means any
+    # score that fails MOMENTUM's volume gate falls back to being evaluated
+    # as MEAN_REVERSION instead of falling through entirely -- MOMENTUM and
+    # MEAN_REVERSION remain mutually exclusive with each other (the `elif`
+    # is still gated on MOMENTUM's own condition not having matched), just
+    # without the extra score<8 restriction on the fallback path.
+    elif absolute_score >= 3 and relative_volume < 2.0:
         qualifying_modes.append("MEAN_REVERSION")
     return qualifying_modes
 
@@ -1512,7 +1710,23 @@ async def broadcaster_loop():
                         # because the composite score was never actually inside the
                         # GAP_FADE entry's trigger range to begin with.
                         if position_mode == "GAP_FADE":
-                            current_exit_metric = score_data.get("gap", 0.0)
+                            # Use gap_unrestricted, NOT gap, here. "gap" is
+                            # the entry-only time-gated metric that
+                            # calculate_gap_fade unconditionally zeroes the
+                            # instant the 9:15-9:30 window ends -- reading
+                            # it here would force-exit every open GAP_FADE
+                            # position at exactly 9:30:00 daily regardless
+                            # of whether the underlying gap had actually
+                            # closed (verified via simulation: entry on a
+                            # real 2.5% gap, price completely unchanged,
+                            # still produced should_exit=True the moment
+                            # the clock passed 9:30:00 using "gap"). The
+                            # window gate makes sense for deciding whether
+                            # a NEW entry should fire; it makes no sense
+                            # for deciding whether an EXISTING position's
+                            # underlying gap has actually closed, which is
+                            # a real-world price fact, not a clock fact.
+                            current_exit_metric = score_data.get("gap_unrestricted", 0.0)
                             if position_direction == "LONG":
                                 should_exit = current_exit_metric <= EXIT_ALERT_SCORE_THRESHOLD
                             else:

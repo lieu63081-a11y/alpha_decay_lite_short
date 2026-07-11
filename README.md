@@ -61,7 +61,7 @@ composite_score = clip(
 
 ## Signal Modes
 
-Decided by `determine_signal_mode(composite_score, relative_volume, gap_fade_raw_score)`:
+Decided by `determine_signal_modes(composite_score, relative_volume, gap_fade_raw_score)`, which returns a **list** of every mode that independently qualifies — not a single priority-ordered choice:
 
 | Mode | Trigger | Cooldown | Suggested SL |
 |------|---------|----------|---------------|
@@ -69,7 +69,11 @@ Decided by `determine_signal_mode(composite_score, relative_volume, gap_fade_raw
 | `MOMENTUM`       | \|composite_score\| ≥ 8 and relative_volume ≥ 1.5          | 300 s | 1.5% |
 | `MEAN_REVERSION` | 3 ≤ \|composite_score\| < 8 and relative_volume < 2.0       | 45 s  | 0.5% |
 
-GAP_FADE is checked first: its direction comes from the gap's own sign (`determine_entry_direction`), which can legitimately differ from the composite score's sign. This is also why the exit-alert logic evaluates GAP_FADE positions against `gap_fade_raw_score`, not the composite score — using the composite score there was a real bug that has since been fixed (see commit history).
+GAP_FADE is computed from `gap_fade_raw_score`, a measurement independent of the composite score, so it can legitimately co-occur with MOMENTUM or MEAN_REVERSION during the 9:15–9:30 window (e.g. a modest gap alongside a much stronger momentum breakout). All three are evaluated independently and every qualifying mode gets its own entry alert, cooldown, and tracked position (MOMENTUM and MEAN_REVERSION remain mutually exclusive with each other by construction, since their `|composite_score|` ranges never overlap). An earlier version checked GAP_FADE first and returned immediately on a match, which silently discarded a simultaneously-qualifying MOMENTUM/MEAN_REVERSION signal — fixed (see commit history).
+
+GAP_FADE's direction comes from the gap's own sign (`determine_entry_direction`), which can legitimately differ from the composite score's sign. This is also why the exit-alert logic evaluates GAP_FADE positions against `gap_fade_raw_score`, not the composite score.
+
+Before generating an entry alert for a (symbol, mode), the broadcaster also checks whether a position is already actively tracked for that exact (symbol, mode) — a plain time-based cooldown alone is not enough, since a position held longer than its own cooldown window would otherwise get a duplicate, unsolicited entry alert while the user is still holding the original one.
 
 ---
 
@@ -79,7 +83,7 @@ GAP_FADE is checked first: its direction comes from the gap's own sign (`determi
 |---|-------|-----------|-------------------|
 | 1 | **WS data flow** | `alpha:hb:data` (5s TTL, refreshed only while ticks are actually arriving in Process A) | `no_data` suppression |
 | 2 | **Alpha Engine alive** | `alpha:hb:B` (3s TTL, refreshed by Process B's heartbeat thread) | `engine_dead` suppression |
-| 3 | **Manual mute** | Redis `alpha:mute` **OR** disk `MUTE_FILE` (fail-safe OR — either alone is enough to mute) | `muted` suppression |
+| 3 | **Manual mute** | Redis `alpha:mute` **OR** disk `MUTE_FILE` (fail-safe OR — either alone is enough to mute); a Redis outage itself is also treated as a suppression condition, since the heartbeat checks (#1, #2) cannot even run without Redis | `muted` / `redis_down` suppression |
 | 4 | **Spread filter** | Per-symbol `calculate_spread_ratio() > SPREAD_RATIO_MAX` gates the composite score to 0 | Score=0, no alert |
 | 5 | **Per-signal cooldown** | Per (symbol, mode) via Redis `SET NX EX` — prevents the SAME signal from firing repeatedly | Duplicate suppressed |
 
@@ -294,6 +298,7 @@ WantedBy=multi-user.target
 | Bot not sending messages | `TELEGRAM_TOKEN` or `TELEGRAM_CHAT_ID` missing/wrong | `grep TELEGRAM .env` to verify |
 | `[C] suppressed=engine_dead` | Process B is down or stuck | Check `[B]` output; the launcher should auto-respawn |
 | `[C] suppressed=no_data` | Angel WS disconnected, or market is closed | Wait for reconnect / market hours |
+| `[C] suppressed=redis_down` | Process C cannot reach Redis at all — this fails SAFE (suppresses alerts) rather than failing open, since none of the heartbeat/mute checks can run without Redis | `systemctl status redis-server`; alerts resume automatically once Redis is reachable again |
 | `redis_errors` counter growing | Redis unreachable | `systemctl status redis-server` |
 | Alerts stopped, then resumed on their own | Scheduled JWT-refresh restart (`AUTO_RESTART_HOURS`) | Expected behavior — the launcher respawns all processes automatically |
 | Script exits with a crash-loop message | More than `MAX_RESTARTS_ALLOWED_PER_WINDOW` restarts within an hour | Real underlying problem (bad credentials, network) — check the printed error before the crash |

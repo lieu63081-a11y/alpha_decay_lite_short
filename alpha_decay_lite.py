@@ -369,12 +369,22 @@ def data_factory():
             # a dict that is missing the "price" key (e.g. a malformed
             # level like {}). best_5_buy_levels[0]["price"] would raise
             # KeyError in that case, crashing this callback (which runs on
-            # the SDK's own thread). Using .get("price", 0) instead of
-            # direct indexing degrades to 0 for that malformed-level case
-            # too, consistent with how every other field in this dict is
-            # already hardened against missing/None values.
-            "best_bid_price": (best_5_buy_levels[0].get("price", 0) / 100.0) if best_5_buy_levels else 0.0,
-            "best_ask_price": (best_5_sell_levels[0].get("price", 0) / 100.0) if best_5_sell_levels else 0.0,
+            # the SDK's own thread). Using .get("price") instead of direct
+            # indexing degrades to None for that malformed-level case too,
+            # consistent with how every other field in this dict is
+            # hardened against missing values -- but .get("price", 0)
+            # ONLY substitutes the default 0 when the "price" KEY is
+            # absent. If the level dict has the key present with an
+            # EXPLICIT JSON null (parsed as Python None -- the exact same
+            # failure mode already fixed for the top-level fields above),
+            # .get("price", 0) returns None, not 0, and None / 100.0
+            # raises TypeError, crashing this callback anyway. Wrapping
+            # with `(... or 0)` -- the same pattern already used for every
+            # top-level field -- converts a missing key, an explicit None,
+            # AND a numeric 0 all to 0 before the division, closing this
+            # nested case the same way.
+            "best_bid_price": ((best_5_buy_levels[0].get("price") or 0) / 100.0) if best_5_buy_levels else 0.0,
+            "best_ask_price": ((best_5_sell_levels[0].get("price") or 0) / 100.0) if best_5_sell_levels else 0.0,
             "cumulative_day_volume": market_data_message.get("volume_trade_for_the_day") or 0,
             "daily_vwap": (market_data_message.get("average_traded_price") or 0) / 100.0,
             "total_buy_quantity": market_data_message.get("total_buy_quantity") or 0,
@@ -720,7 +730,20 @@ def update_rolling_windows(symbol_state, tick_data):
             symbol_state.last_cumulative_volume > 0
             and drop_amount > symbol_state.last_cumulative_volume * RESET_DROP_FRACTION_THRESHOLD)
         if looks_like_a_reset:
-            symbol_state.last_cumulative_volume = tick_data["cumulative_day_volume"]
+            # NOTE: tick_data["cumulative_day_volume"] itself could be
+            # negative (a malformed/corrupt feed value -- cumulative
+            # traded volume should never legitimately go negative).
+            # Rebasing the watermark directly to such a value would set
+            # last_cumulative_volume < 0, which would make the VERY NEXT
+            # tick's `if symbol_state.last_cumulative_volume < 0:` guard
+            # above misfire as "first tick ever for this symbol" again --
+            # silently re-establishing a brand-new baseline (losing the
+            # real delta for that next tick) instead of computing volume
+            # normally. Clamping the rebase target to 0 keeps the
+            # watermark itself always non-negative, so that guard can only
+            # ever be true on a symbol's genuine first tick.
+            symbol_state.last_cumulative_volume = max(
+                tick_data["cumulative_day_volume"], 0)
         delta_volume = 0
 
     symbol_state.volume_sum_last_60_seconds.add(current_timestamp, delta_volume)
@@ -899,6 +922,22 @@ def alpha_engine():
             tick_count_in_window, last_stats_print_time = 0, current_time
 
     print("[B] shutting down (signal received)", flush=True)
+    # ZMQ sockets default to LINGER=-1 (infinite): close() will block
+    # waiting to flush any outstanding/buffered-but-unsent messages for as
+    # long as it takes, and zmq_context.term() below blocks until every
+    # socket from this context is closed. Together, an unflushed PUB
+    # socket (score_publisher) with a slow/absent SUB peer could make
+    # close() itself hang indefinitely -- defeating the whole point of the
+    # close-before-term ordering already in place. Setting LINGER=0 makes
+    # close() drop any unsent messages immediately instead of waiting,
+    # which is the correct trade-off during shutdown (a signal-only
+    # advisory alert that never sends is far less harmful than a process
+    # that hangs and has to be SIGKILLed by the launcher's 5s timeout).
+    for zmq_socket in (tick_subscriber, score_publisher):
+        try:
+            zmq_socket.setsockopt(zmq.LINGER, 0)
+        except Exception:
+            pass
     tick_subscriber.close()
     score_publisher.close()
     # Closing individual sockets releases their file descriptors, but the
@@ -914,22 +953,46 @@ def alpha_engine():
 # ============================================================
 # PROCESS C: BROADCASTER + TELEGRAM BOT
 # ============================================================
-def determine_signal_mode(composite_score, relative_volume, gap_fade_raw_score=0.0):
-    """Decides which alert mode (if any) the current score/volume/gap
-    combination qualifies for. Checked in priority order:
+def determine_signal_modes(composite_score, relative_volume, gap_fade_raw_score=0.0):
+    """Decides which alert mode(s) the current score/volume/gap
+    combination qualifies for:
        GAP_FADE       : |gap_fade_raw_score| >= 2.0
                          (only nonzero 9:15-9:30 IST, via calculate_gap_fade's gating)
        MOMENTUM       : |composite_score| >= 8 and relative_volume >= 1.5
        MEAN_REVERSION : 3 <= |composite_score| < 8 and relative_volume < 2.0
-    Returns None if none of the above conditions are met."""
+
+    Returns a LIST of every mode that independently qualifies, NOT a
+    single priority-ordered choice. An earlier version of this function
+    checked GAP_FADE first and returned immediately on a match, which
+    meant a modest gap (e.g. gap=2.1, just above its own 2.0 threshold)
+    would completely swallow a simultaneously-occurring, much stronger
+    MOMENTUM signal (e.g. composite_score=9.5, relative_volume=5.0) --
+    verified via simulation: that exact combination returned only
+    "GAP_FADE", silently discarding the MOMENTUM signal entirely.
+
+    GAP_FADE is evaluated from gap_fade_raw_score, a value computed
+    independently of the composite score (see calculate_gap_fade) -- so
+    it is not "the same underlying signal at different strengths" as
+    MOMENTUM/MEAN_REVERSION, it is a genuinely distinct measurement that
+    can legitimately coexist with either of the other two. MOMENTUM and
+    MEAN_REVERSION themselves are mutually exclusive by construction
+    (their |composite_score| ranges do not overlap: >=8 vs [3, 8)), so
+    at most one of those two can ever qualify at the same time -- only
+    GAP_FADE can additionally co-occur with one of them. The caller
+    (broadcaster_loop) already tracks alerts per (symbol, mode) with
+    independent cooldowns and independent tracked-position keys, so
+    returning multiple modes here does not require any new
+    infrastructure -- it simply stops discarding a mode that already had
+    everywhere else it needed to be handled independently."""
+    qualifying_modes = []
     if abs(gap_fade_raw_score) >= 2.0:
-        return "GAP_FADE"
+        qualifying_modes.append("GAP_FADE")
     absolute_score = abs(composite_score)
     if absolute_score >= 8 and relative_volume >= 1.5:
-        return "MOMENTUM"
-    if 3 <= absolute_score < 8 and relative_volume < 2.0:
-        return "MEAN_REVERSION"
-    return None
+        qualifying_modes.append("MOMENTUM")
+    elif 3 <= absolute_score < 8 and relative_volume < 2.0:
+        qualifying_modes.append("MEAN_REVERSION")
+    return qualifying_modes
 
 
 async def is_entry_cooldown_expired(redis_client, symbol, mode):
@@ -1277,10 +1340,24 @@ async def check_suppression_status(redis_client_async):
         if not await redis_client_async.get("alpha:hb:data"):
             return True, "no_data"
     except Exception:
-        # Redis itself is unreachable -- fall back to the disk-only mute
-        # check so the fail-safe OR semantics still hold.
+        # Redis itself is unreachable. The PREVIOUS behavior here was:
+        #   mute_file_exists = await asyncio.to_thread(os.path.exists, MUTE_FILE_PATH)
+        #   return mute_file_exists, "muted"
+        # which is a fail-OPEN bug for a safety-critical function: if
+        # Redis is down AND the disk mute file happens not to exist, this
+        # returned (False, "muted") -- meaning "NOT suppressed" -- at
+        # exactly the moment none of the heartbeat checks above (kill
+        # switches #1 and #2: is Process B alive, is data flowing) could
+        # even run, because they all depend on the same unreachable Redis.
+        # Verified via trace: a Redis outage with no disk flag present
+        # silently allowed alerts to keep firing with zero live safety
+        # checks in effect -- the exact opposite of what a kill switch is
+        # for. Fail SAFE instead: treat a Redis outage itself as a
+        # suppression condition (return True unconditionally), and only
+        # use the disk check to report a more specific reason if it's the
+        # thing that's actually set.
         mute_file_exists = await asyncio.to_thread(os.path.exists, MUTE_FILE_PATH)
-        return mute_file_exists, "muted"
+        return True, ("muted" if mute_file_exists else "redis_down")
     return False, ""
 
 
@@ -1393,6 +1470,18 @@ async def broadcaster_loop():
                     # positions under different modes at the same time (e.g.
                     # RELIANCE GAP_FADE and RELIANCE MOMENTUM both active).
                     # Check every mode's tracked-position key for this symbol.
+                    #
+                    # modes_with_active_position is also reused below, in the
+                    # entry-alert section (part 2), to SKIP generating a brand
+                    # new entry alert for a mode that already has a position
+                    # being tracked for this symbol. Without this, a position
+                    # held past its (much shorter) entry cooldown -- e.g. a
+                    # MOMENTUM position ACK'd and held for 20 minutes while
+                    # its 300s entry cooldown key naturally expires -- would
+                    # get a completely fresh, duplicate entry alert on the
+                    # very next tick that still qualifies, even though the
+                    # user is still actively holding the original position.
+                    modes_with_active_position = set()
                     for candidate_mode in COOLDOWN_SECONDS_BY_MODE:
                         try:
                             tracked_position_json = await redis_client_async.get(
@@ -1404,6 +1493,7 @@ async def broadcaster_loop():
                         if not tracked_position_json:
                             continue
 
+                        modes_with_active_position.add(candidate_mode)
                         tracked_position = json.loads(tracked_position_json)
                         position_direction = tracked_position.get(
                             "direction",
@@ -1456,12 +1546,45 @@ async def broadcaster_loop():
                     # the user decides which alerts to act on. Only a
                     # per-(symbol, mode) cooldown is applied, to avoid
                     # sending a duplicate of the SAME signal repeatedly.
-                    signal_mode = determine_signal_mode(
+                    #
+                    # determine_signal_modes() returns a LIST, not a single
+                    # priority-ordered mode: GAP_FADE is a genuinely distinct
+                    # measurement from MOMENTUM/MEAN_REVERSION (computed from
+                    # gap_fade_raw_score, independently of the composite
+                    # score) and can legitimately co-occur with one of them.
+                    # An earlier version returned only the first match in a
+                    # fixed GAP_FADE > MOMENTUM > MEAN_REVERSION order, which
+                    # meant a modest gap (e.g. 2.1, barely over its own 2.0
+                    # threshold) would silently discard a simultaneously
+                    # qualifying, much stronger MOMENTUM signal -- verified
+                    # via simulation (score=9.5, rvol=5.0, gap=2.1 returned
+                    # only "GAP_FADE"). Iterating every qualifying mode here
+                    # and evaluating each one's cooldown/tracked-position
+                    # state independently fixes that without discarding
+                    # anything, since the rest of this codebase (cooldown
+                    # keys, tracked-position keys, exit-alert loop above)
+                    # already keys everything by (symbol, mode).
+                    qualifying_modes = determine_signal_modes(
                         score_data["score"], score_data["relative_volume"],
                         score_data.get("gap", 0.0))
-                    if not signal_mode:
+                    if not qualifying_modes:
                         stats_counters["no_qualifying_mode"] += 1
-                    else:
+                    for signal_mode in qualifying_modes:
+                        # Skip entry generation entirely if this (symbol,
+                        # mode) already has an actively tracked position --
+                        # see modes_with_active_position above. The entry
+                        # cooldown alone is NOT sufficient for this: it is
+                        # purely time-based (e.g. 300s for MOMENTUM) and has
+                        # no awareness of whether the position is still
+                        # open, so a position held longer than its own
+                        # cooldown window would otherwise get a duplicate,
+                        # unsolicited fresh entry alert on the next
+                        # qualifying tick despite the user still holding
+                        # the original one.
+                        if signal_mode in modes_with_active_position:
+                            stats_counters["position_already_tracked"] = (
+                                stats_counters.get("position_already_tracked", 0) + 1)
+                            continue
                         try:
                             if not await is_entry_cooldown_expired(
                                     redis_client_async, score_data["symbol"], signal_mode):
@@ -1511,6 +1634,22 @@ async def broadcaster_loop():
         # this process never actually shuts down gracefully, defeating the
         # entire purpose of adding term() in the first place. Close the
         # socket FIRST, then terminate the context.
+        #
+        # LINGER=0 before close(): default LINGER=-1 (infinite) means
+        # close() itself can block waiting to flush any buffered-but-
+        # unsent messages, which -- combined with term() blocking until
+        # every socket is closed -- reintroduces exactly the kind of
+        # shutdown hang this close-before-term ordering was written to
+        # prevent. score_subscriber is a SUB socket (it only receives, via
+        # zmq.SUBSCRIBE), so its own outbound buffer is normally just the
+        # subscription-filter handshake, but setting LINGER=0 here removes
+        # any possibility of a hang regardless of pyzmq/libzmq version
+        # internals, at zero behavioral cost during a shutdown that is
+        # discarding this socket anyway.
+        try:
+            score_subscriber.setsockopt(zmq.LINGER, 0)
+        except Exception:
+            pass
         try:
             score_subscriber.close()
         except Exception as socket_close_error:

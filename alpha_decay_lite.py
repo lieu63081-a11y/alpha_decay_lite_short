@@ -167,7 +167,38 @@ class RollingWindowSum:
         """Add a new (timestamp, value) sample and evict anything older
         than window_seconds. IMPORTANT: call this on every tick, even with
         value=0.0, so that eviction always runs and old data never lingers
-        during a quiet stretch with no meaningful contribution."""
+        during a quiet stretch with no meaningful contribution.
+
+        Rejects (does not append) any sample whose timestamp is OLDER than
+        the newest entry already at the back of entries. Every consumer of
+        this class relies on entries staying in strictly non-decreasing
+        chronological order: eviction above only ever inspects the FRONT
+        of the deque, and span_seconds() computes entries[-1][0] -
+        entries[0][0] assuming the back is always the newest. A stale or
+        out-of-order sample (network jitter, a WebSocket reconnect
+        replaying a buffered packet, a duplicate/retransmitted tick)
+        appended at the back anyway breaks both of those assumptions at
+        once: span_seconds() can go NEGATIVE (verified via simulation: an
+        out-of-order packet arriving ~30s "in the past" relative to the
+        already-processed stream produced a negative span, which
+        immediately -- but only for that one tick -- misfires
+        calculate_relative_volume's warmup check and forces RVOL back to
+        a neutral 1.0). Worse, and longer-lasting: the sample's VALUE
+        itself gets added to running_sum and then sits unevicted for up
+        to the full window_seconds, since front-only eviction can't reach
+        an entry buried behind newer ones by arrival order rather than by
+        timestamp order -- verified via simulation: an anomalous volume
+        value injected out of order remained inside a 20-minute window's
+        running_sum, silently inflating it, for the entire ~20 minutes
+        until eviction finally caught up to it. Rejecting the sample here
+        keeps the invariant intact for every window this class backs
+        (volume_sum_last_60_seconds, volume_sum_last_20_minutes,
+        aggressive_signed_volume_30s, aggressive_absolute_volume_30s),
+        the same way the out-of-order guard already added separately for
+        last_traded_price_history_30s (a plain deque, not this class)
+        protects that structure."""
+        if self.entries and timestamp < self.entries[-1][0]:
+            return
         self.entries.append((timestamp, value))
         self.running_sum += value
         eviction_cutoff = timestamp - self.window_seconds
@@ -215,6 +246,41 @@ def start_heartbeat_thread(heartbeat_name, redis_client, additional_check=None):
 # ============================================================
 # PROCESS A: DATA FACTORY (Angel SmartWebSocketV2, snap-quote mode 3)
 # ============================================================
+def download_scrip_master_with_retry():
+    """Downloads Angel's scrip master JSON with a short retry/backoff
+    loop. The plain requests.get() this replaces had no exception
+    handling at all: a transient DNS failure or network timeout right at
+    process startup (before the WebSocket connection or anything else
+    has even been attempted) would raise immediately and crash Process A
+    on the very first call. That crash is indistinguishable, from the
+    launcher's point of view, from any other process death -- it counts
+    toward MAX_RESTARTS_ALLOWED_PER_WINDOW the same way -- so a network
+    outage lasting a few minutes at startup could burn through the
+    crash-loop budget on nothing but this one download and trip the
+    launcher's FATAL shutdown (sys.exit(1), stopping Process B and C too,
+    not just A) before the network even has a chance to recover. A short
+    bounded retry with exponential backoff absorbs exactly this kind of
+    transient failure without needing a full process restart cycle for
+    each attempt; if the network is down for longer than this loop's
+    total budget, this still raises (there is no infinite retry here) so
+    a genuinely persistent outage falls back to the launcher's existing
+    crash-loop breaker as before, rather than hanging forever."""
+    max_attempts = 4
+    retry_delay_seconds = 3
+    last_error = None
+    for attempt_number in range(1, max_attempts + 1):
+        try:
+            return requests.get(SCRIP_MASTER_URL, timeout=60).json()
+        except (requests.exceptions.RequestException, ValueError) as download_error:
+            last_error = download_error
+            print(f"[A] scrip master download failed (attempt {attempt_number}/"
+                  f"{max_attempts}): {download_error!r}", flush=True)
+            if attempt_number < max_attempts:
+                time.sleep(retry_delay_seconds)
+                retry_delay_seconds *= 2
+    raise last_error
+
+
 def resolve_nse_equity_tokens(symbol_list):
     """Downloads Angel's scrip master JSON and maps each requested NSE
     equity symbol (e.g. 'RELIANCE') to its numeric exchange token, which
@@ -222,7 +288,7 @@ def resolve_nse_equity_tokens(symbol_list):
     Returns a dict of {token: symbol} for every symbol that was found."""
     start_time = time.time()
     print("[A] Downloading scrip master (~4 MB)...", flush=True)
-    scrip_master_list = requests.get(SCRIP_MASTER_URL, timeout=60).json()
+    scrip_master_list = download_scrip_master_with_retry()
     nse_symbol_to_token = {
         entry["symbol"].replace("-EQ", ""): entry["token"]
         for entry in scrip_master_list

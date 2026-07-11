@@ -7,6 +7,101 @@ NOTE ON NAMING: every variable and function in this file uses a full,
 descriptive name (no single-letter or cryptic abbreviations) so that
 the code is self-explanatory without needing to cross-reference this
 comment block or external documentation.
+
+================================================================================
+READING GUIDE / TABLE OF CONTENTS  (यह फाइल कैसे पढ़ें)
+================================================================================
+यह फ़ाइल 3 अलग प्रोसेस चलाती है (ऊपर pipeline diagram देखें)। ऊपर से नीचे
+लीनियर पढ़ने के बजाय, नीचे दिए गए क्रम में पढ़ना ज़्यादा आसान रहेगा -- हर
+हिस्सा काफ़ी हद तक स्वतंत्र (self-contained) है।
+
+सुझाया गया पढ़ने का क्रम:
+  1. CONFIGURATION CONSTANTS   -- सब कुछ किन नंबरों पर चलता है, यह समझ लें
+  2. ROLLING WINDOW HELPER     -- हर calculator इसी पर बना है, पहले समझना ज़रूरी
+  3. PROCESS A (Data Factory)  -- डेटा कहाँ से आता है
+  4. PROCESS B (Alpha Engine)  -- 9 calculators + score गणना (सबसे भारी हिस्सा)
+  5. PROCESS C (Broadcaster)   -- अलर्ट कब/कैसे भेजे जाते हैं + Telegram बटन
+  6. LAUNCHER                  -- सब कुछ शुरू/बंद/restart कैसे होता है
+
+हर सेक्शन नीचे "======" वाली लाइनों से अलग किया गया है -- अपने एडिटर में
+Ctrl+F से नीचे दिए गए EXACT TEXT खोजें तो सीधे उस सेक्शन पर पहुँच जाएंगे
+(line नंबर भी दिए हैं, पर एडिट होने पर बदल सकते हैं -- टेक्स्ट सर्च ज़्यादा भरोसेमंद है):
+
+    "CONFIGURATION CONSTANTS"                          (कॉन्फ़िगरेशन, लगभग यहीं से शुरू)
+    "AMORTIZED-O(1) ROLLING WINDOW HELPER"              (RollingWindowSum क्लास)
+    "HEARTBEAT HELPER"                                  (heartbeat थ्रेड हेल्पर)
+    "PROCESS A: DATA FACTORY"                           (Angel WebSocket ingest)
+    "PROCESS B: ALPHA ENGINE"                           (9 calculators + score)
+    "PROCESS C: BROADCASTER + TELEGRAM BOT"             (अलर्ट भेजना)
+    "LAUNCHER: self-healing"                            (३ प्रोसेस मैनेज करना)
+
+--------------------------------------------------------------------------
+INDEX  (function/class नाम -> संक्षिप्त विवरण, लाइन नंबर सेक्शन के अनुसार क्रम में)
+--------------------------------------------------------------------------
+
+[शुरुआत / कॉन्फ़िगरेशन]
+  clip_value()                        -- किसी value को [min, max] रेंज में clamp करे
+  is_within_trading_hours()           -- क्या अभी NSE का ट्रेडिंग टाइम है (watchdog के लिए)
+
+[ROLLING WINDOW HELPER]
+  class RollingWindowSum              -- O(1) amortized rolling sum, out-of-order-safe
+  start_heartbeat_thread()            -- हर प्रोसेस की "मैं ज़िंदा हूँ" heartbeat (Redis में)
+
+[PROCESS A: DATA FACTORY  -- Angel WebSocket से टिक डेटा लाना]
+  download_scrip_master_with_retry()  -- scrip master JSON डाउनलोड, network retry के साथ
+  resolve_nse_equity_tokens()         -- symbol नाम -> Angel token नंबर मैपिंग
+  data_factory()                      -- Process A का मुख्य entry point
+    ├─ Angel login + JWT auto-refresh timer
+    ├─ tick-starvation watchdog (zombie कनेक्शन पकड़ने के लिए)
+    ├─ on_tick_received()             -- हर टिक पर चलने वाला callback (नेस्टेड फंक्शन)
+    └─ graceful shutdown (SIGTERM/SIGINT handler)
+
+[PROCESS B: ALPHA ENGINE  -- 9 calculators + score गणना]
+  class SymbolState                   -- हर symbol की rolling state (एक copy प्रति stock)
+  calculate_vwap_distance()           -- Calculator #1: VWAP से कितनी दूर है price
+  calculate_relative_volume()         -- Calculator #2: RVOL (आज का वॉल्यूम बनाम औसत)
+  calculate_aggressive_buy_pressure() -- Calculator #3: आक्रामक खरीद/बिक्री दबाव
+  calculate_absorption()              -- Calculator #4: भारी वॉल्यूम फिर भी price flat (absorption)
+  calculate_book_imbalance()          -- Calculator #5: bid/ask quantity असंतुलन
+  calculate_spread_ratio()            -- Calculator #6: spread फिल्टर (जो score को 0 कर दे)
+  calculate_gap_fade_unrestricted()   -- gap-fade का मूल फॉर्मूला (समय की कोई सीमा नहीं)
+  calculate_gap_fade()                -- Calculator #7: वही फॉर्मूला, पर सिर्फ़ 9:15-9:30 में
+  calculate_session_weight()          -- Calculator #8: दिन के किस हिस्से में हैं (weight)
+  compute_feature_score()             -- सभी 9 calculators को जोड़कर एक composite score बनाना
+  classify_trade_direction()          -- Lee-Ready ट्रेड क्लासिफिकेशन (खरीद या बिक्री?)
+  update_rolling_windows()            -- हर टिक पर सभी rolling windows अपडेट करना
+  alpha_engine()                      -- Process B का मुख्य entry point (इसमें Calculator #9 -
+                                          EMA smoother - भी inline लिखा है, अलग function नहीं)
+
+[PROCESS C: BROADCASTER + TELEGRAM BOT  -- अलर्ट भेजना]
+  determine_signal_modes()            -- स्कोर/वॉल्यूम/गैप देखकर कौन सा mode (MOMENTUM/
+                                          MEAN_REVERSION/GAP_FADE) qualify करता है
+  is_entry_cooldown_expired()         -- entry cooldown चेक (per symbol+mode)
+  is_exit_cooldown_expired()          -- exit cooldown चेक (per symbol+mode)
+  build_entry_alert_text()            -- entry अलर्ट का मैसेज टेक्स्ट बनाना
+  build_exit_alert_text()             -- exit अलर्ट का मैसेज टेक्स्ट बनाना
+  initialize_telegram_bot()           -- Telegram bot शुरू करना + ACK/SKIP/DONE/HOLD बटन लॉजिक
+  shutdown_telegram_bot()             -- Telegram bot बंद करना
+  determine_entry_direction()         -- LONG या SHORT? (हर mode के लिए सही तरीका)
+  send_entry_alert()                  -- entry अलर्ट भेजना (या bot disabled हो तो stdout पर print)
+  send_exit_alert()                   -- exit अलर्ट भेजना
+  check_suppression_status()          -- 5 में से कौन सा kill-switch अभी active है, चेक करना
+  broadcaster_loop()                  -- Process C का मुख्य लूप (सबसे बड़ा फंक्शन, ध्यान से पढ़ें)
+  run_broadcaster_process()           -- asyncio wrapper ताकि multiprocessing इसे चला सके
+
+[LAUNCHER  -- तीनों प्रोसेस शुरू/बंद/restart करना]
+  cleanup_ipc_socket_files()          -- पुरानी ZMQ socket फ़ाइलें साफ़ करना
+  spawn_all_processes()               -- A, B, C तीनों प्रोसेस शुरू करना
+  shutdown_all_processes()            -- तीनों को ग्रेसफुली बंद करना (SIGTERM फिर ज़रूरत हो तो SIGKILL)
+  if __name__ == "__main__":          -- मेन लूप: process मरे तो respawn, crash-loop breaker
+
+--------------------------------------------------------------------------
+हर बड़े comment block में ये पैटर्न मिलेगा (ये bug-fix history है, ignore मत
+करें) -- जहाँ भी "NOTE:", "IMPORTANT:", या "verified via simulation" लिखा
+हो, वहाँ किसी असली bug को ढूंढ कर fix किया गया था। वो comment बताता है कि
+वो कोड उस particular तरीके से क्यों लिखा गया, ताकि कोई future edit उस bug
+को दोबारा introduce न करे।
+================================================================================
 """
 import os
 import sys

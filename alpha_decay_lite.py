@@ -714,12 +714,7 @@ async def is_exit_cooldown_expired(redis_client, symbol):
 
 def build_entry_alert_text(score_data, mode):
     """Builds the human-readable text for an entry alert message."""
-    if mode == "GAP_FADE":
-        # For a gap-fade alert, the meaningful direction is the gap's own
-        # sign, not the composite score's sign.
-        direction = "LONG" if score_data.get("gap", 0.0) > 0 else "SHORT"
-    else:
-        direction = "LONG" if score_data["score"] > 0 else "SHORT"
+    direction = determine_entry_direction(score_data, mode)
 
     stop_loss_text_by_mode = {
         "MOMENTUM": "1.5%", "MEAN_REVERSION": "0.5%", "GAP_FADE": "gap-based"}
@@ -738,8 +733,13 @@ def build_entry_alert_text(score_data, mode):
 
 def build_exit_alert_text(symbol, tracked_position, current_score, current_last_traded_price):
     """Builds the human-readable text for an exit alert message, fired
-    when an ACK'd position's score decays back toward zero."""
-    direction = "LONG" if tracked_position["score_at_entry"] > 0 else "SHORT"
+    when an ACK'd position's score has moved back toward (or through)
+    the exit threshold."""
+    # Prefer the direction saved at entry time (correct for every mode,
+    # including GAP_FADE). Fall back to deriving it from score_at_entry
+    # only for positions created before this field existed.
+    direction = tracked_position.get(
+        "direction", "LONG" if tracked_position["score_at_entry"] > 0 else "SHORT")
     entry_price = tracked_position.get("ltp_entry", 0)
     profit_loss_percent = (
         (current_last_traded_price - entry_price) / entry_price * 100
@@ -872,6 +872,21 @@ async def shutdown_telegram_bot():
         print(f"[C] TG shutdown err: {shutdown_error!r}", flush=True)
 
 
+def determine_entry_direction(score_data, mode):
+    """Single source of truth for an entry's LONG/SHORT direction. For
+    GAP_FADE, the meaningful direction is the gap's own sign (not the
+    composite score's sign, which can differ). For all other modes, the
+    composite score's sign is the direction. Used both when building the
+    entry alert text AND when persisting the pending position, so the
+    exit alert can later read the SAME direction back reliably instead
+    of re-deriving it from score_at_entry (which is wrong for GAP_FADE,
+    since a gap-fade's score and its trade direction are not always the
+    same sign)."""
+    if mode == "GAP_FADE":
+        return "LONG" if score_data.get("gap", 0.0) > 0 else "SHORT"
+    return "LONG" if score_data["score"] > 0 else "SHORT"
+
+
 async def send_entry_alert(redis_client_async, score_data, mode):
     """Sends (or, if the bot is disabled, prints) an entry alert with
     ACK/SKIP buttons, and persists the pending alert details in Redis
@@ -891,6 +906,7 @@ async def send_entry_alert(redis_client_async, score_data, mode):
         pending_position_data = {
             "symbol": score_data["symbol"],
             "mode": mode,
+            "direction": determine_entry_direction(score_data, mode),
             "score_at_entry": score_data["score"],
             "peak": score_data["peak"],
             "ltp_entry": score_data["last_traded_price"],
@@ -928,11 +944,17 @@ async def check_suppression_status(redis_client_async):
     """Checks all suppression conditions in priority order and returns
     (is_suppressed, reason_string). The caller is responsible for caching
     this result for a short interval to avoid hitting Redis/disk on every
-    single incoming score message."""
+    single incoming score message.
+
+    The disk check (os.path.exists) is run via asyncio.to_thread rather
+    than called directly, since it is a synchronous/blocking system call.
+    On a typical /tmp tmpfs this completes in microseconds, so the
+    practical impact is negligible, but calling blocking I/O directly
+    inside an asyncio coroutine is still avoided here as good practice."""
     try:
         if bool(await redis_client_async.get("alpha:mute")):
             return True, "muted"
-        if os.path.exists(MUTE_FILE_PATH):
+        if await asyncio.to_thread(os.path.exists, MUTE_FILE_PATH):
             return True, "muted"
         if not await redis_client_async.get("alpha:hb:B"):
             return True, "engine_dead"
@@ -941,7 +963,8 @@ async def check_suppression_status(redis_client_async):
     except Exception:
         # Redis itself is unreachable -- fall back to the disk-only mute
         # check so the fail-safe OR semantics still hold.
-        return os.path.exists(MUTE_FILE_PATH), "muted"
+        mute_file_exists = await asyncio.to_thread(os.path.exists, MUTE_FILE_PATH)
+        return mute_file_exists, "muted"
     return False, ""
 
 
@@ -995,7 +1018,17 @@ async def broadcaster_loop():
                     reason = cached_suppression_state["reason"]
                     stats_counters[reason] = stats_counters.get(reason, 0) + 1
                 else:
-                    # 1) Exit alerts for previously ACK'd positions whose score has decayed.
+                    # 1) Exit alerts for previously ACK'd positions whose score has
+                    # either decayed back toward zero OR reversed hard against the
+                    # entry direction. Using abs(current_score) <= threshold alone
+                    # is NOT sufficient: if a LONG entry's score reverses sharply
+                    # negative (e.g. +8.5 at entry -> -6.0 on a trend reversal),
+                    # abs(-6.0) = 6.0 is NOT <= 2.0, so a plain-abs check would
+                    # never fire an exit alert even though the position is now
+                    # moving strongly AGAINST the user. The check below fires
+                    # whenever the score has fallen through the LONG exit
+                    # threshold, or risen through the SHORT exit threshold --
+                    # covering both "decayed to flat" and "reversed against us".
                     try:
                         tracked_position_json = await redis_client_async.get(
                             f"alpha:pos:{score_data['symbol']}")
@@ -1003,17 +1036,27 @@ async def broadcaster_loop():
                         tracked_position_json = None
                         stats_counters["redis_errors"] += 1
 
-                    if (tracked_position_json
-                            and abs(score_data["score"]) <= EXIT_ALERT_SCORE_THRESHOLD):
-                        try:
-                            if await is_exit_cooldown_expired(
-                                    redis_client_async, score_data["symbol"]):
-                                await send_exit_alert(
-                                    score_data, json.loads(tracked_position_json))
-                                stats_counters["exit_alerts_sent"] += 1
-                        except Exception as exit_error:
-                            stats_counters["redis_errors"] += 1
-                            print(f"[C] exit err: {exit_error!r}", flush=True)
+                    if tracked_position_json:
+                        tracked_position = json.loads(tracked_position_json)
+                        position_direction = tracked_position.get(
+                            "direction",
+                            "LONG" if tracked_position["score_at_entry"] > 0 else "SHORT")
+                        current_score = score_data["score"]
+
+                        if position_direction == "LONG":
+                            should_exit = current_score <= EXIT_ALERT_SCORE_THRESHOLD
+                        else:
+                            should_exit = current_score >= -EXIT_ALERT_SCORE_THRESHOLD
+
+                        if should_exit:
+                            try:
+                                if await is_exit_cooldown_expired(
+                                        redis_client_async, score_data["symbol"]):
+                                    await send_exit_alert(score_data, tracked_position)
+                                    stats_counters["exit_alerts_sent"] += 1
+                            except Exception as exit_error:
+                                stats_counters["redis_errors"] += 1
+                                print(f"[C] exit err: {exit_error!r}", flush=True)
 
                     # 2) Entry alerts for newly qualifying signals.
                     # No global rate limiting -- this is an advisory system,

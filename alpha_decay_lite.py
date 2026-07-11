@@ -88,6 +88,9 @@ ZMQ_HIGH_WATER_MARK      = 10000   # max queued messages per ZMQ socket before d
 LATENCY_WARNING_MS       = 100     # log a warning if tick-to-score latency exceeds this
 MUTE_STATUS_CACHE_SECONDS = 1.0    # how long Process C caches the mute/heartbeat check
 RVOL_WARMUP_SECONDS      = 300     # need 5+ minutes of history before RVOL is meaningful
+RESET_DROP_FRACTION_THRESHOLD = 0.5   # a >50% drop in cumulative volume is treated as a
+                                       # broker-side counter reset (rebase), not a stale/
+                                       # out-of-order packet (reject) -- see update_rolling_windows
 PEAK_SCORE_HALF_LIFE_SECONDS = 60.0  # how fast the "peak score" amplitude decays over time
 AUTO_RESTART_AFTER_HOURS = float(os.getenv("AUTO_RESTART_HOURS", "20"))  # < Angel JWT ~24-28h expiry
 
@@ -284,6 +287,7 @@ def data_factory():
     # Heartbeats: kill switch #1 (is data flowing) + kill switch #2's counterpart (process alive).
     heartbeat_redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     last_tick_received_at = {"timestamp": 0.0}
+    last_heartbeat_write_from_tick = {"timestamp": 0.0}   # throttle for the tick-driven heartbeat write
 
     def check_data_is_flowing():
         seconds_since_last_tick = time.time() - last_tick_received_at["timestamp"]
@@ -309,7 +313,32 @@ def data_factory():
         symbol = token_to_symbol_map.get(str(market_data_message.get("token")))
         if not symbol:
             return
-        last_tick_received_at["timestamp"] = time.time()
+        now = time.time()
+        last_tick_received_at["timestamp"] = now
+
+        # Kill switch #1's Redis key (alpha:hb:data) is normally refreshed
+        # only by the background heartbeat thread, which sleeps for
+        # HEARTBEAT_WRITE_INTERVAL_SECONDS (1s) between writes. That thread
+        # is NOT triggered by tick arrival -- it runs on its own independent
+        # schedule. Consequence: if the market goes quiet for more than
+        # DATA_FLOW_HEARTBEAT_TTL_SECONDS (5s), the Redis key expires: and
+        # when a brand-new, perfectly valid tick then arrives, Process C
+        # can still see the EXPIRED key for up to ~1 more second (until the
+        # heartbeat thread's next scheduled wake), incorrectly suppressing
+        # a fresh, legitimate signal as "no_data". Verified via simulation:
+        # a tick arriving 2ms before the heartbeat thread's next wake was
+        # suppressed for the remaining ~1 second.
+        # Fix: write the heartbeat key directly, right here, on every tick
+        # -- but throttled to once per second so this doesn't add a Redis
+        # round-trip to the hot per-tick path. This closes the gap between
+        # "data resumed" and "heartbeat key reflects that" to milliseconds.
+        if now - last_heartbeat_write_from_tick["timestamp"] >= HEARTBEAT_WRITE_INTERVAL_SECONDS:
+            try:
+                heartbeat_redis_client.setex(
+                    "alpha:hb:data", DATA_FLOW_HEARTBEAT_TTL_SECONDS, "1")
+                last_heartbeat_write_from_tick["timestamp"] = now
+            except Exception:
+                pass   # the background heartbeat thread will catch up regardless
 
         best_5_buy_levels  = market_data_message.get("best_5_buy_data") or []
         best_5_sell_levels = market_data_message.get("best_5_sell_data") or []
@@ -335,8 +364,17 @@ def data_factory():
             "symbol": symbol,
             "timestamp": time.time(),
             "last_traded_price": (market_data_message.get("last_traded_price") or 0) / 100.0,
-            "best_bid_price": (best_5_buy_levels[0]["price"] / 100.0) if best_5_buy_levels else 0.0,
-            "best_ask_price": (best_5_sell_levels[0]["price"] / 100.0) if best_5_sell_levels else 0.0,
+            # NOTE: checking `if best_5_buy_levels` only guards against an
+            # EMPTY list; it does not guard against the first element being
+            # a dict that is missing the "price" key (e.g. a malformed
+            # level like {}). best_5_buy_levels[0]["price"] would raise
+            # KeyError in that case, crashing this callback (which runs on
+            # the SDK's own thread). Using .get("price", 0) instead of
+            # direct indexing degrades to 0 for that malformed-level case
+            # too, consistent with how every other field in this dict is
+            # already hardened against missing/None values.
+            "best_bid_price": (best_5_buy_levels[0].get("price", 0) / 100.0) if best_5_buy_levels else 0.0,
+            "best_ask_price": (best_5_sell_levels[0].get("price", 0) / 100.0) if best_5_sell_levels else 0.0,
             "cumulative_day_volume": market_data_message.get("volume_trade_for_the_day") or 0,
             "daily_vwap": (market_data_message.get("average_traded_price") or 0) / 100.0,
             "total_buy_quantity": market_data_message.get("total_buy_quantity") or 0,
@@ -528,7 +566,14 @@ def calculate_gap_fade(_symbol_state, tick_data):
     local_time = time.localtime(tick_data["timestamp"])
     is_within_gap_window = (local_time.tm_hour == 9
                             and 15 <= local_time.tm_min < 30)
-    if not is_within_gap_window or not tick_data["previous_close_price"]:
+    # NOTE: previous_close_price was already checked for truthiness (it's
+    # the divisor below), but open_price was NOT -- if the feed hasn't
+    # populated open_price yet (0/missing, e.g. on the very first ticks of
+    # the day before the exchange has published an official open), the
+    # formula below computes (0 - previous_close_price) / previous_close_price,
+    # an artificial -100% "gap" that clips to +3.0 and can spuriously
+    # trigger a bullish GAP_FADE alert with no real gap having occurred.
+    if not is_within_gap_window or not tick_data["previous_close_price"] or not tick_data["open_price"]:
         return 0.0
     gap_percent = ((tick_data["open_price"] - tick_data["previous_close_price"])
                    / tick_data["previous_close_price"]) * 100
@@ -543,7 +588,14 @@ def calculate_session_weight(_symbol_state, tick_data):
        MID_QUIET  (everything else) -> 0.8  (lower conviction, dampen)"""
     local_time = time.localtime(tick_data["timestamp"])
     hour, minute = local_time.tm_hour, local_time.tm_min
-    if hour == 9 and minute < 45:
+    # NOTE: the original condition was `hour == 9 and minute < 45`, which
+    # covers 09:00-09:44 -- including NSE's pre-open session (09:00-09:15:
+    # order collection, matching, and buffer), not just the documented
+    # 09:15-09:45 continuous-trading open window. Pre-open ticks are not
+    # regular continuous trading and were getting the same 1.2 OPEN_VOL
+    # boost as genuine post-open ticks. Restricting to minute >= 15 makes
+    # the code match its own docstring.
+    if hour == 9 and 15 <= minute < 45:
         return 1.2
     if (hour == 14 and minute >= 45) or (hour == 15 and minute <= 30):
         return 1.1
@@ -628,26 +680,47 @@ def update_rolling_windows(symbol_state, tick_data):
         symbol_state.last_cumulative_volume = tick_data["cumulative_day_volume"]
     else:
         # The new cumulative volume is LOWER than the watermark we already
-        # have. Since cumulative_day_volume only ever increases over the
-        # trading day, this can only mean the tick arrived out of order
-        # (a network-delayed older packet reordered behind a newer one --
-        # common with UDP-style delivery and WebSocket reconnects).
+        # have. Two distinct real-world causes produce this, and they need
+        # OPPOSITE handling:
         #
-        # Treating this as a normal update (the old behavior: delta =
-        # max(0, new - old), then overwrite the watermark with the SMALLER
-        # value) corrupts the running watermark downward. The next
-        # in-order tick would then compute its delta against that too-low
-        # watermark, double-counting volume that was already recorded.
-        # Example (verified via simulation): watermark=1000, an
-        # out-of-order tick reports 980 (delta=0, but watermark WRONGLY
-        # drops to 980), then the next real tick reports 1010 -- computing
-        # delta = 1010-980 = 30 instead of the correct 1010-1000 = 10,
-        # a 3x volume overstatement that can spuriously inflate RVOL and
-        # trigger a false MOMENTUM alert.
+        # (a) Out-of-order/delayed packet: a network-reordered older tick
+        #     arrives slightly behind a newer one. The gap between the
+        #     reported value and the watermark is small (typically a few
+        #     seconds' worth of volume). Treating this as a normal update
+        #     would corrupt the watermark downward and cause the next
+        #     in-order tick to double-count volume (verified via
+        #     simulation in a prior commit: watermark=1000, stale tick
+        #     980, next real tick 1010 -- wrongly computed delta=30
+        #     instead of the correct 10). The fix for this case is to
+        #     reject the tick: delta=0, watermark unchanged.
         #
-        # Fix: treat cumulative_day_volume as monotonically non-decreasing.
-        # An out-of-order/stale tick contributes zero volume and the
-        # watermark is left untouched, so it cannot corrupt future deltas.
+        # (b) Genuine broker-side counter reset: some broker backends are
+        #     known to occasionally reset a symbol's cumulative volume
+        #     counter mid-day (a backend glitch, not a network artifact).
+        #     If we applied fix (a) unconditionally here, a real reset
+        #     (e.g. watermark=5,000,000 resetting to 1,000) would cause
+        #     EVERY subsequent tick to be rejected as "stale" forever,
+        #     since the counter would need to climb from 1,000 back past
+        #     5,000,000 before a single tick could pass the >= check again
+        #     -- silently muting this symbol's volume-derived signals
+        #     (RVOL, and everything downstream of it) for the rest of the
+        #     day. That failure mode is arguably worse than the original
+        #     double-counting bug this logic was written to fix.
+        #
+        # Heuristic to tell them apart: a network-reordered packet is
+        # bounded by how much volume could plausibly trade in the few
+        # seconds of reordering delay -- nowhere near the day's total
+        # volume. A genuine reset drops by a LARGE fraction of the
+        # watermark itself. RESET_DROP_FRACTION_THRESHOLD below treats
+        # any drop of more than 50% of the current watermark as a reset
+        # (rebase to the new value, contributing 0 volume for this tick
+        # only) rather than a stale packet (reject, watermark unchanged).
+        drop_amount = symbol_state.last_cumulative_volume - tick_data["cumulative_day_volume"]
+        looks_like_a_reset = (
+            symbol_state.last_cumulative_volume > 0
+            and drop_amount > symbol_state.last_cumulative_volume * RESET_DROP_FRACTION_THRESHOLD)
+        if looks_like_a_reset:
+            symbol_state.last_cumulative_volume = tick_data["cumulative_day_volume"]
         delta_volume = 0
 
     symbol_state.volume_sum_last_60_seconds.add(current_timestamp, delta_volume)
@@ -870,10 +943,13 @@ async def is_entry_cooldown_expired(redis_client, symbol, mode):
     return bool(was_newly_set)
 
 
-async def is_exit_cooldown_expired(redis_client, symbol):
-    """Same pattern as is_entry_cooldown_expired, but for exit alerts,
-    which use a single fixed cooldown regardless of mode."""
-    cooldown_key = f"alpha:exitcd:{symbol}"
+async def is_exit_cooldown_expired(redis_client, symbol, mode):
+    """Same pattern as is_entry_cooldown_expired, but for exit alerts.
+    Keyed by (symbol, mode) -- matching the tracked-position key -- so
+    that concurrently tracked positions for the same symbol under
+    different modes (e.g. RELIANCE GAP_FADE and RELIANCE MOMENTUM both
+    ACK'd) get independent exit-alert cooldowns rather than sharing one."""
+    cooldown_key = f"alpha:exitcd:{symbol}:{mode}"
     was_newly_set = await redis_client.set(
         cooldown_key, "1", ex=EXIT_ALERT_COOLDOWN_SECONDS, nx=True)
     return bool(was_newly_set)
@@ -901,7 +977,10 @@ def build_entry_alert_text(score_data, mode):
 def build_exit_alert_text(symbol, tracked_position, current_score, current_last_traded_price):
     """Builds the human-readable text for an exit alert message, fired
     when an ACK'd position's score has moved back toward (or through)
-    the exit threshold."""
+    the exit threshold. current_score is whichever metric actually
+    decided the exit for this position's mode (the gap score for
+    GAP_FADE, the composite score for every other mode) -- see the
+    caller (send_exit_alert) for why this matters."""
     # Prefer the direction saved at entry time (correct for every mode,
     # including GAP_FADE). Fall back to deriving it from score_at_entry
     # only for positions created before this field existed -- using
@@ -991,8 +1070,17 @@ async def initialize_telegram_bot(redis_client_async):
                 pending_info = await redis_client.get(
                     f"alpha:pending:{callback_query.message.message_id}")
                 if pending_info:
+                    # NOTE: the tracked-position key includes MODE, not just
+                    # symbol (alpha:pos:{symbol}:{mode}, not alpha:pos:{symbol}).
+                    # A symbol-only key means ACK'ing a second signal for the
+                    # SAME symbol under a DIFFERENT mode (e.g. RELIANCE
+                    # GAP_FADE ACK'd, then later RELIANCE MOMENTUM ACK'd)
+                    # would silently overwrite the first position -- its
+                    # exit tracking is lost permanently, since nothing else
+                    # references the old key. Including mode lets both
+                    # positions be tracked independently.
                     await redis_client.setex(
-                        f"alpha:pos:{symbol}", TRACKED_POSITION_TTL_SECONDS, pending_info)
+                        f"alpha:pos:{symbol}:{mode}", TRACKED_POSITION_TTL_SECONDS, pending_info)
                     await redis_client.delete(
                         f"alpha:pending:{callback_query.message.message_id}")
                     await callback_query.edit_message_text(
@@ -1014,14 +1102,28 @@ async def initialize_telegram_bot(redis_client_async):
                     parse_mode="HTML", reply_markup=None)
 
             elif action == "DONE":
-                await redis_client.delete(f"alpha:pos:{symbol}")
+                await redis_client.delete(f"alpha:pos:{symbol}:{mode}")
+                # Re-arm the entry cooldown for this (symbol, mode) on DONE.
+                # Without this, if enough real time has passed since entry
+                # that the original entry cooldown already expired naturally
+                # (e.g. the user held a MOMENTUM position for an hour, but
+                # its cooldown was only 300s), deleting the tracked position
+                # does nothing to prevent re-entry: if the score is STILL
+                # inside the trigger band on the very next tick, a brand-new
+                # entry alert fires immediately for the position the user
+                # just closed. Setting a fresh cooldown gives the user a
+                # deliberate cool-down period after manually closing a trade
+                # before the same (symbol, mode) signal can alert again.
+                await redis_client.set(
+                    f"alpha:cd:{symbol}:{mode}", "1",
+                    ex=COOLDOWN_SECONDS_BY_MODE.get(mode, EXIT_ALERT_COOLDOWN_SECONDS))
                 await callback_query.edit_message_text(
                     text=f"{original_text_html}\n\n✔️ DONE — position closed",
                     parse_mode="HTML", reply_markup=None)
 
             elif action == "HOLD":
                 await redis_client.setex(
-                    f"alpha:exitcd:{symbol}", EXIT_ALERT_COOLDOWN_SECONDS * 2, "1")
+                    f"alpha:exitcd:{symbol}:{mode}", EXIT_ALERT_COOLDOWN_SECONDS * 2, "1")
                 await callback_query.edit_message_text(
                     text=f"{original_text_html}\n\n⏳ HOLDING — exit cooldown extended",
                     parse_mode="HTML", reply_markup=None)
@@ -1118,11 +1220,15 @@ async def send_entry_alert(redis_client_async, score_data, mode):
         print(f"[C] TG entry send failed: {send_error!r}", flush=True)
 
 
-async def send_exit_alert(score_data, tracked_position):
+async def send_exit_alert(score_data, tracked_position, displayed_score):
     """Sends (or, if the bot is disabled, prints) an exit alert with
-    DONE/HOLD MORE buttons for a previously ACK'd position."""
+    DONE/HOLD MORE buttons for a previously ACK'd position. displayed_score
+    is whichever metric (composite score or gap score) actually decided
+    the exit -- see the caller in broadcaster_loop -- so the message text
+    matches the real trigger instead of always showing the composite score
+    even for a GAP_FADE exit that was decided from the gap score."""
     alert_text = build_exit_alert_text(
-        score_data["symbol"], tracked_position, score_data["score"],
+        score_data["symbol"], tracked_position, displayed_score,
         score_data["last_traded_price"])
     telegram_application = TELEGRAM_BOT_STATE["application"]
 
@@ -1151,7 +1257,18 @@ async def check_suppression_status(redis_client_async):
     practical impact is negligible, but calling blocking I/O directly
     inside an asyncio coroutine is still avoided here as good practice."""
     try:
-        if bool(await redis_client_async.get("alpha:mute")):
+        # NOTE: bool(some_string) in Python is True for EVERY non-empty
+        # string, including "0" and "false" -- Redis always returns
+        # strings (or None if the key is absent), never Python booleans.
+        # bool(await redis_client_async.get("alpha:mute")) would therefore
+        # treat a key explicitly set to "0" (intending "not muted") as
+        # muted, which is the opposite of the intended fail-safe OR
+        # semantics documented for this kill switch. Comparing against the
+        # specific string "1" (the value this codebase always writes when
+        # muting) avoids that trap; a key that is absent (None) or set to
+        # anything other than "1" is treated as not-muted.
+        mute_value = await redis_client_async.get("alpha:mute")
+        if mute_value == "1":
             return True, "muted"
         if await asyncio.to_thread(os.path.exists, MUTE_FILE_PATH):
             return True, "muted"
@@ -1270,19 +1387,28 @@ async def broadcaster_loop():
                     # whenever the score has fallen through the LONG exit
                     # threshold, or risen through the SHORT exit threshold --
                     # covering both "decayed to flat" and "reversed against us".
-                    try:
-                        tracked_position_json = await redis_client_async.get(
-                            f"alpha:pos:{score_data['symbol']}")
-                    except Exception:
-                        tracked_position_json = None
-                        stats_counters["redis_errors"] += 1
+                    #
+                    # Positions are tracked per (symbol, mode), not per symbol
+                    # alone, so a single symbol can have independently ACK'd
+                    # positions under different modes at the same time (e.g.
+                    # RELIANCE GAP_FADE and RELIANCE MOMENTUM both active).
+                    # Check every mode's tracked-position key for this symbol.
+                    for candidate_mode in COOLDOWN_SECONDS_BY_MODE:
+                        try:
+                            tracked_position_json = await redis_client_async.get(
+                                f"alpha:pos:{score_data['symbol']}:{candidate_mode}")
+                        except Exception:
+                            tracked_position_json = None
+                            stats_counters["redis_errors"] += 1
 
-                    if tracked_position_json:
+                        if not tracked_position_json:
+                            continue
+
                         tracked_position = json.loads(tracked_position_json)
                         position_direction = tracked_position.get(
                             "direction",
                             "LONG" if tracked_position.get("score_at_entry", 0.0) > 0 else "SHORT")
-                        position_mode = tracked_position.get("mode", "")
+                        position_mode = tracked_position.get("mode", candidate_mode)
 
                         # GAP_FADE's direction is derived from the GAP's sign, not
                         # the composite score's sign (see determine_entry_direction) --
@@ -1296,23 +1422,30 @@ async def broadcaster_loop():
                         # because the composite score was never actually inside the
                         # GAP_FADE entry's trigger range to begin with.
                         if position_mode == "GAP_FADE":
-                            current_gap_score = score_data.get("gap", 0.0)
+                            current_exit_metric = score_data.get("gap", 0.0)
                             if position_direction == "LONG":
-                                should_exit = current_gap_score <= EXIT_ALERT_SCORE_THRESHOLD
+                                should_exit = current_exit_metric <= EXIT_ALERT_SCORE_THRESHOLD
                             else:
-                                should_exit = current_gap_score >= -EXIT_ALERT_SCORE_THRESHOLD
+                                should_exit = current_exit_metric >= -EXIT_ALERT_SCORE_THRESHOLD
                         else:
-                            current_score = score_data["score"]
+                            current_exit_metric = score_data["score"]
                             if position_direction == "LONG":
-                                should_exit = current_score <= EXIT_ALERT_SCORE_THRESHOLD
+                                should_exit = current_exit_metric <= EXIT_ALERT_SCORE_THRESHOLD
                             else:
-                                should_exit = current_score >= -EXIT_ALERT_SCORE_THRESHOLD
+                                should_exit = current_exit_metric >= -EXIT_ALERT_SCORE_THRESHOLD
 
                         if should_exit:
                             try:
                                 if await is_exit_cooldown_expired(
-                                        redis_client_async, score_data["symbol"]):
-                                    await send_exit_alert(score_data, tracked_position)
+                                        redis_client_async, score_data["symbol"], position_mode):
+                                    # Pass the metric that actually triggered this exit
+                                    # (gap score for GAP_FADE, composite score otherwise)
+                                    # so the Telegram message reports the same number the
+                                    # decision was based on, instead of always showing the
+                                    # composite score even when a GAP_FADE exit was really
+                                    # decided from the gap score.
+                                    await send_exit_alert(
+                                        score_data, tracked_position, current_exit_metric)
                                     stats_counters["exit_alerts_sent"] += 1
                             except Exception as exit_error:
                                 stats_counters["redis_errors"] += 1

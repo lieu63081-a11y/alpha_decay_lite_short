@@ -303,6 +303,29 @@ WantedBy=multi-user.target
 
 ## Known Limitations (by design, not bugs to silently ignore)
 
+- **GAP_FADE's raw gap score is static for the entire 9:15-9:29:59 window.**
+  `calculate_gap_fade` computes the gap from `open_price` and
+  `previous_close_price`, both of which are fixed for the entire trading day
+  once the market opens (the day's open doesn't change, and yesterday's
+  close obviously doesn't either). This means the gap score does NOT track
+  how much of the gap has actually been "filled" by price moving toward the
+  previous close in real time -- it reflects the gap's size AT OPEN, constant
+  until the time window itself ends at 9:30 and the function starts
+  returning 0.0 unconditionally. A more responsive design would compute the
+  gap using `last_traded_price` instead of `open_price` (so the score decays
+  as price actually approaches previous_close_price), but that is a
+  meaningfully different signal definition, not a small patch, so it was not
+  changed here without discussing whether that's the intended strategy.
+
+- **A rapid double-click (or a slow/retried Telegram client) on the same
+  button can produce a harmless "Message is not modified" error in the logs.**
+  `handle_button_callback`'s broad `except Exception` catches this without
+  crashing or corrupting state (the underlying Redis operations like
+  `setex`/`delete` are idempotent), but it does add a log line per duplicate
+  click. A per-message-id short-lived Redis lock would eliminate the log
+  noise; not added here since it doesn't affect correctness, and adds
+  another Redis round-trip to every button press to fix a cosmetic issue.
+
 These are architectural trade-offs, documented here so they are not mistaken for
 oversights. Each has a real cost; each was also evaluated against the cost of
 fixing it properly, and left as-is for now.

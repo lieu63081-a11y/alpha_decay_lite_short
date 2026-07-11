@@ -318,18 +318,31 @@ def data_factory():
         if ANGEL_BID_ASK_IS_SWAPPED:
             best_5_buy_levels, best_5_sell_levels = best_5_sell_levels, best_5_buy_levels
 
+        # NOTE: dict.get(key, default) only returns the default when the
+        # key is ABSENT from the dict. If the broker's feed sends the key
+        # with an explicit JSON null (parsed by Python's json module as
+        # None), .get(key, 0) returns None, not 0 -- and None / 100.0
+        # raises TypeError, crashing this callback (and, since it runs
+        # inside the SDK's own thread, potentially crashing the whole
+        # process). Wrapping each lookup in `(... or 0)` converts both a
+        # missing key AND an explicit None/0/empty value to 0 before the
+        # division, so a single malformed field in the feed cannot take
+        # down Process A. Applied to every field that is divided by 100.0
+        # below (price and VWAP fields); quantity fields (total_buy_
+        # quantity etc.) are not divided so they don't share this
+        # specific failure mode, but are also wrapped for consistency.
         tick_data = {
             "symbol": symbol,
             "timestamp": time.time(),
-            "last_traded_price": market_data_message.get("last_traded_price", 0) / 100.0,
+            "last_traded_price": (market_data_message.get("last_traded_price") or 0) / 100.0,
             "best_bid_price": (best_5_buy_levels[0]["price"] / 100.0) if best_5_buy_levels else 0.0,
             "best_ask_price": (best_5_sell_levels[0]["price"] / 100.0) if best_5_sell_levels else 0.0,
-            "cumulative_day_volume": market_data_message.get("volume_trade_for_the_day", 0),
-            "daily_vwap": market_data_message.get("average_traded_price", 0) / 100.0,
-            "total_buy_quantity": market_data_message.get("total_buy_quantity", 0),
-            "total_sell_quantity": market_data_message.get("total_sell_quantity", 0),
-            "open_price": market_data_message.get("open_price_of_the_day", 0) / 100.0,
-            "previous_close_price": market_data_message.get("closed_price", 0) / 100.0,
+            "cumulative_day_volume": market_data_message.get("volume_trade_for_the_day") or 0,
+            "daily_vwap": (market_data_message.get("average_traded_price") or 0) / 100.0,
+            "total_buy_quantity": market_data_message.get("total_buy_quantity") or 0,
+            "total_sell_quantity": market_data_message.get("total_sell_quantity") or 0,
+            "open_price": (market_data_message.get("open_price_of_the_day") or 0) / 100.0,
+            "previous_close_price": (market_data_message.get("closed_price") or 0) / 100.0,
         }
         try:
             tick_publisher.send_multipart(
@@ -344,7 +357,30 @@ def data_factory():
         f"[A] WS error: {error}", flush=True)
     websocket_client.on_close = lambda _websocket: print(
         "[A] WS closed (SDK will reconnect)", flush=True)
-    websocket_client.connect()
+
+    # websocket_client.connect() is a BLOCKING call -- it runs the SDK's
+    # own event loop on this thread and does not return until the
+    # connection is closed (confirmed by this process staying alive and
+    # publishing ticks for hours without any additional loop below this
+    # point). Because of that, a SIGTERM handler here cannot simply set a
+    # flag for a `while` loop to check (there is no such loop -- connect()
+    # itself occupies the thread); it must actively call close_connection()
+    # to make connect() return, after which cleanup below can run normally.
+    def handle_stop_signal(_signum, _frame):
+        print("[A] shutdown signal received, closing WebSocket...", flush=True)
+        try:
+            websocket_client.close_connection()
+        except Exception as close_error:
+            print(f"[A] WS close error during shutdown: {close_error!r}", flush=True)
+
+    signal.signal(signal.SIGTERM, handle_stop_signal)
+    signal.signal(signal.SIGINT, handle_stop_signal)
+
+    websocket_client.connect()   # blocks here until close_connection() is called or the SDK gives up
+
+    print("[A] shutting down (WebSocket connection closed)", flush=True)
+    tick_publisher.close()
+    zmq_context.term()
 
 
 # ============================================================
@@ -738,7 +774,21 @@ def alpha_engine():
         # else: this tick has the same timestamp as the previous one (a
         # batched/duplicate tick) -- preserve the previous smoothed score
         # and peak amplitude unchanged.
-        symbol_state.last_tick_timestamp = tick_data["timestamp"]
+        #
+        # IMPORTANT: last_tick_timestamp must only ever move FORWARD. An
+        # out-of-order/delayed tick (network jitter, WS reconnect replay)
+        # can arrive with a timestamp EARLIER than the one already stored.
+        # Unconditionally overwriting last_tick_timestamp with such a tick's
+        # timestamp would push the watermark backwards; the next in-order
+        # tick would then compute delta_time_seconds against that too-early
+        # watermark, overstating the elapsed time and distorting both the
+        # EMA alpha (calculator #9) and the peak-amplitude decay factor.
+        # Verified via trace: tick1 ts=5, out-of-order tick2 ts=3 (correctly
+        # skipped for EMA update above), tick3 ts=6 -- the old unconditional
+        # assignment left last_tick_timestamp=3 after tick2, so tick3's
+        # delta_time_seconds became 6-3=3 instead of the correct 6-5=1.
+        symbol_state.last_tick_timestamp = max(
+            symbol_state.last_tick_timestamp, tick_data["timestamp"])
 
         if latency_ms > LATENCY_WARNING_MS:
             print(f"[B] high lat={latency_ms:.0f}ms sym={symbol}", flush=True)
@@ -1311,13 +1361,27 @@ async def broadcaster_loop():
         # garbage collector eventually finalizes the client (which for a
         # process that's exiting right after this point may never happen
         # cleanly), producing a "Unclosed client session" / "Unclosed
-        # connector" warning on stderr. zmq_context.term() blocks until
-        # the context's I/O threads have shut down, mirroring the same
-        # cleanup already done in alpha_engine()'s shutdown path.
+        # connector" warning on stderr.
         try:
             await redis_client_async.aclose()
         except Exception as redis_close_error:
             print(f"[C] redis close err: {redis_close_error!r}", flush=True)
+
+        # CRITICAL ordering requirement: zmq_context.term() blocks
+        # (hangs forever) until every socket created from that context has
+        # been closed. score_subscriber was never explicitly closed before
+        # this term() call was added in a prior commit -- it relied on the
+        # socket eventually being garbage-collected, which term() does NOT
+        # wait for reliably in all pyzmq versions. Without an explicit
+        # close() first, term() could block indefinitely, and the launcher
+        # would only recover via its 5-second SIGKILL fallback -- meaning
+        # this process never actually shuts down gracefully, defeating the
+        # entire purpose of adding term() in the first place. Close the
+        # socket FIRST, then terminate the context.
+        try:
+            score_subscriber.close()
+        except Exception as socket_close_error:
+            print(f"[C] score_subscriber close err: {socket_close_error!r}", flush=True)
         try:
             zmq_context.term()
         except Exception as zmq_close_error:

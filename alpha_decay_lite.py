@@ -62,7 +62,21 @@ ZMQ_TICKS_ADDRESS   = "ipc:///tmp/alpha_ticks.ipc"    # Process A -> Process B
 ZMQ_SCORES_ADDRESS  = "ipc:///tmp/alpha_scores.ipc"   # Process B -> Process C
 REDIS_URL            = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 MUTE_FILE_PATH       = os.getenv("MUTE_FILE", "/tmp/alpha_mute.flag")
-TRADING_UNIVERSE     = os.getenv("UNIVERSE", "RELIANCE,TCS,HDFCBANK").split(",")
+TRADING_UNIVERSE     = [symbol.strip() for symbol in
+                         os.getenv("UNIVERSE", "RELIANCE,TCS,HDFCBANK").split(",")
+                         if symbol.strip()]
+                        # .strip() per symbol: a .env value written as
+                        # "RELIANCE, TCS, HDFCBANK" (spaces after commas --
+                        # a very natural way to type it for readability) would
+                        # otherwise split into [' TCS', ' HDFCBANK'] with a
+                        # leading space baked into each symbol name. Angel's
+                        # scrip master has no entry for " TCS", so those
+                        # symbols would be silently dropped from the
+                        # universe -- no crash, just quietly missing data for
+                        # them, which is a hard thing to notice at a glance.
+                        # The `if symbol.strip()` also guards against a
+                        # trailing comma (e.g. "RELIANCE,TCS,") producing a
+                        # stray empty-string entry in the list.
 SCRIP_MASTER_URL     = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
 TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()

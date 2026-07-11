@@ -91,6 +91,14 @@ RVOL_WARMUP_SECONDS      = 300     # need 5+ minutes of history before RVOL is m
 PEAK_SCORE_HALF_LIFE_SECONDS = 60.0  # how fast the "peak score" amplitude decays over time
 AUTO_RESTART_AFTER_HOURS = float(os.getenv("AUTO_RESTART_HOURS", "20"))  # < Angel JWT ~24-28h expiry
 
+# Process exit codes the launcher inspects to decide how to react.
+# 0 (a bare `return`) and any other unrecognized code are treated as an
+# unplanned crash -> respawn and count against the crash-loop breaker.
+EXIT_CODE_PLANNED_RESTART = 2   # scheduled JWT-refresh self-exit -> respawn immediately, no penalty
+EXIT_CODE_FATAL_CONFIG    = 3   # missing/invalid credentials or config -> NOT retryable; stop immediately
+                                # instead of burning through the crash-loop budget on an error that
+                                # will not fix itself without human intervention (editing .env)
+
 # ---- Kill switches (heartbeats) ----
 PROCESS_HEARTBEAT_TTL_SECONDS      = 3   # process-alive heartbeat TTL (kill switch #2)
 DATA_FLOW_HEARTBEAT_TTL_SECONDS    = 5   # data-is-flowing heartbeat TTL (kill switch #1)
@@ -224,7 +232,7 @@ def data_factory():
     missing_env_vars = [name for name, value in required_env_vars.items() if not value]
     if missing_env_vars:
         print(f"[A] FATAL missing env vars: {missing_env_vars}. Fill .env and restart.")
-        return
+        os._exit(EXIT_CODE_FATAL_CONFIG)
 
     print("[A] Logging in to Angel...", flush=True)
     angel_connection = SmartConnect(api_key=angel_api_key)
@@ -232,7 +240,7 @@ def data_factory():
         current_totp_code = pyotp.TOTP(angel_totp_secret).now()
     except Exception as totp_error:
         print(f"[A] FATAL invalid TOTP secret: {totp_error}. ANGEL_TOTP_SECRET must be base32.")
-        return
+        os._exit(EXIT_CODE_FATAL_CONFIG)
 
     login_session = angel_connection.generateSession(
         angel_client_code, angel_password, current_totp_code)
@@ -243,7 +251,7 @@ def data_factory():
         print("       - ANGEL_PASSWORD must be your 4-digit MPIN (not web login password)")
         print("       - ANGEL_TOTP_SECRET must be the full base32 secret (not 6-digit code)")
         print("       - Ensure system time is NTP-synced: `timedatectl`")
-        return
+        os._exit(EXIT_CODE_FATAL_CONFIG)
 
     auth_token = login_session["data"]["jwtToken"]
     feed_token = angel_connection.getfeedToken()
@@ -256,7 +264,7 @@ def data_factory():
         def exit_for_scheduled_restart():
             print(f"[A] JWT nearing expiry ({AUTO_RESTART_AFTER_HOURS}h up), "
                   f"exiting for restart", flush=True)
-            os._exit(2)   # exit code 2 signals "planned restart" to the launcher
+            os._exit(EXIT_CODE_PLANNED_RESTART)
 
         restart_timer = threading.Timer(AUTO_RESTART_AFTER_HOURS * 3600,
                                          exit_for_scheduled_restart)
@@ -380,16 +388,31 @@ def calculate_vwap_distance(_symbol_state, tick_data):
 
 def calculate_relative_volume(symbol_state, _tick_data):
     """Calculator #2: RVOL = last-60-seconds volume divided by the average
-    per-minute volume of the PRIOR 19 minutes (the most recent 60 seconds
-    is explicitly excluded from the baseline to avoid self-inclusion bias).
-    Returns a neutral 1.0 during the first 5 minutes of history (warmup),
-    to avoid false spikes caused by a near-empty baseline."""
-    if symbol_state.volume_sum_last_20_minutes.span_seconds() < RVOL_WARMUP_SECONDS:
+    per-minute volume of the PRIOR baseline minutes (the most recent 60
+    seconds is explicitly excluded from the baseline to avoid
+    self-inclusion bias). Returns a neutral 1.0 during the first 5
+    minutes of history (warmup), to avoid false spikes caused by a
+    near-empty baseline.
+
+    IMPORTANT: the baseline divisor is the ACTUAL number of elapsed
+    baseline minutes so far (capped at 19, since the window holds at
+    most 20 minutes and 1 of those is the excluded most-recent-60s),
+    NOT a hardcoded 19.0. Dividing by a fixed 19.0 while the window has
+    only been accumulating for, say, 5-6 minutes would understate the
+    baseline volume by roughly 3-4x, which inflates RVOL by the same
+    factor and can spuriously satisfy the MOMENTUM mode's rvol >= 1.5
+    threshold on perfectly ordinary volume. Verified via simulation: at
+    5 minutes of steady (non-spiking) volume, the fixed-19.0 version
+    reported rvol=4.75 where the true value is 1.00; the elapsed-minutes
+    version correctly reports 1.00 throughout."""
+    window = symbol_state.volume_sum_last_20_minutes
+    if window.span_seconds() < RVOL_WARMUP_SECONDS:
         return 1.0
     baseline_volume_sum = max(
-        symbol_state.volume_sum_last_20_minutes.running_sum
-        - symbol_state.volume_sum_last_60_seconds.running_sum, 0.0)
-    baseline_volume_per_minute = baseline_volume_sum / 19.0
+        window.running_sum - symbol_state.volume_sum_last_60_seconds.running_sum, 0.0)
+    elapsed_baseline_minutes = max(1.0, (window.span_seconds() - 60) / 60)
+    baseline_minutes = min(19.0, elapsed_baseline_minutes)
+    baseline_volume_per_minute = baseline_volume_sum / baseline_minutes
     return symbol_state.volume_sum_last_60_seconds.running_sum / max(baseline_volume_per_minute, 1.0)
 
 
@@ -462,14 +485,13 @@ def calculate_spread_ratio(_symbol_state, tick_data):
 
 
 def calculate_gap_fade(_symbol_state, tick_data):
-    """Calculator #7: gap-fade signal, active only in the 9:15:00-9:30:00
-    IST window (inclusive). Returns the negated percentage gap between the
-    day's open and the previous close, so a positive result means 'fade
-    the gap by going long' and a negative result means 'fade by going
-    short'."""
+    """Calculator #7: gap-fade signal, active only in the 9:15:00-9:29:59
+    IST window. Returns the negated percentage gap between the day's open
+    and the previous close, so a positive result means 'fade the gap by
+    going long' and a negative result means 'fade by going short'."""
     local_time = time.localtime(tick_data["timestamp"])
     is_within_gap_window = (local_time.tm_hour == 9
-                            and 15 <= local_time.tm_min <= 30)
+                            and 15 <= local_time.tm_min < 30)
     if not is_within_gap_window or not tick_data["previous_close_price"]:
         return 0.0
     gap_percent = ((tick_data["open_price"] - tick_data["previous_close_price"])
@@ -854,14 +876,23 @@ async def initialize_telegram_bot(redis_client_async):
 
             # NOTE: edit_message_text() accepts a reply_markup parameter that
             # replaces (or, when None, removes) the message's inline keyboard
-            # in the SAME API call. The previous version made two separate
-            # calls (edit_message_reply_markup then edit_message_text) for
-            # every button press -- doubling Telegram API usage for no
-            # benefit, and occasionally risking a
-            # 'Message is not modified' error between the two calls.
-            # Also using message.text_html (instead of message.text) so
-            # that if any future alert text adopts HTML formatting, a
-            # button press won't silently strip it back to plain text.
+            # in the SAME API call. Making one call instead of two (a prior
+            # version called edit_message_reply_markup then edit_message_text
+            # separately) halves Telegram API usage per button press and
+            # avoids a 'Message is not modified' race between the two calls.
+            #
+            # We read message.text_html (HTML-escaped: '&','<','>' become
+            # '&amp;','&lt;','&gt;') and pass parse_mode="HTML" on every
+            # edit_message_text call below so Telegram actually interprets
+            # those entities instead of showing them as literal text. Using
+            # text_html WITHOUT parse_mode="HTML" (an earlier version of
+            # this code did exactly that) would show raw HTML-escaped
+            # entities to the user, e.g. "S&amp;P" instead of "S&P", the
+            # moment any alert text contains such a character. Current
+            # alert text has none of those characters today, but this pairs
+            # the escaping with the matching parse_mode so it stays correct
+            # if that ever changes, rather than leaving a latent bug for
+            # whoever edits build_entry_alert_text next.
             original_text_html = callback_query.message.text_html
 
             if action == "ACK":
@@ -874,12 +905,12 @@ async def initialize_telegram_bot(redis_client_async):
                         f"alpha:pending:{callback_query.message.message_id}")
                     await callback_query.edit_message_text(
                         text=f"{original_text_html}\n\n✅ ACK'd — tracking for exit",
-                        reply_markup=None)
+                        parse_mode="HTML", reply_markup=None)
                 else:
                     await callback_query.edit_message_text(
                         text=f"{original_text_html}\n\n"
                              f"✅ ACK'd (details expired after 24h)",
-                        reply_markup=None)
+                        parse_mode="HTML", reply_markup=None)
 
             elif action == "SKIP":
                 skip_log_key = f"alpha:skip:{time.strftime('%Y%m%d')}"
@@ -888,20 +919,20 @@ async def initialize_telegram_bot(redis_client_async):
                 await redis_client.expire(skip_log_key, 30 * 24 * 3600)
                 await callback_query.edit_message_text(
                     text=f"{original_text_html}\n\n⏭️ SKIPPED (logged)",
-                    reply_markup=None)
+                    parse_mode="HTML", reply_markup=None)
 
             elif action == "DONE":
                 await redis_client.delete(f"alpha:pos:{symbol}")
                 await callback_query.edit_message_text(
                     text=f"{original_text_html}\n\n✔️ DONE — position closed",
-                    reply_markup=None)
+                    parse_mode="HTML", reply_markup=None)
 
             elif action == "HOLD":
                 await redis_client.setex(
                     f"alpha:exitcd:{symbol}", EXIT_ALERT_COOLDOWN_SECONDS * 2, "1")
                 await callback_query.edit_message_text(
                     text=f"{original_text_html}\n\n⏳ HOLDING — exit cooldown extended",
-                    reply_markup=None)
+                    parse_mode="HTML", reply_markup=None)
         except Exception as button_error:
             print(f"[C] button handler err: {button_error!r}", flush=True)
 
@@ -1323,10 +1354,29 @@ if __name__ == "__main__":
             if dead_processes:
                 exit_codes_by_process_name = {
                     process.name: process.exitcode for process in dead_processes}
+
+                # EXIT_CODE_FATAL_CONFIG means a process hit a non-retryable
+                # error (missing/invalid .env credentials, bad TOTP secret,
+                # Angel login rejected, etc). Respawning would just repeat
+                # the exact same failure until the crash-loop breaker trips
+                # anyway, burning ~2 minutes and cluttering the log with
+                # identical error messages for a problem that only a human
+                # editing .env can fix. Stop immediately instead.
+                has_fatal_config_error = any(
+                    code == EXIT_CODE_FATAL_CONFIG for code in exit_codes_by_process_name.values())
+                if has_fatal_config_error:
+                    shutdown_all_processes(
+                        running_processes,
+                        f"fatal config error, not retrying: {exit_codes_by_process_name}")
+                    print("[launcher] FATAL: a process exited due to invalid configuration "
+                          "or credentials (see the error above). Fix .env and restart manually "
+                          "-- not retrying automatically.", flush=True)
+                    sys.exit(1)
+
                 # Exit code 2 is our own signal for "planned restart" (e.g. the
                 # scheduled JWT-refresh self-exit in data_factory).
                 is_planned_restart = any(
-                    code == 2 for code in exit_codes_by_process_name.values())
+                    code == EXIT_CODE_PLANNED_RESTART for code in exit_codes_by_process_name.values())
                 shutdown_reason = ("planned restart (JWT refresh)" if is_planned_restart
                                   else f"process died: {exit_codes_by_process_name}")
                 shutdown_all_processes(running_processes, shutdown_reason)

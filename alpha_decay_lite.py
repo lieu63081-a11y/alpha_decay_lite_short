@@ -586,10 +586,33 @@ def update_rolling_windows(symbol_state, tick_data):
         # single-tick spike.
         symbol_state.last_cumulative_volume = tick_data["cumulative_day_volume"]
         delta_volume = 0
-    else:
-        delta_volume = max(0, tick_data["cumulative_day_volume"]
-                          - symbol_state.last_cumulative_volume)
+    elif tick_data["cumulative_day_volume"] >= symbol_state.last_cumulative_volume:
+        delta_volume = (tick_data["cumulative_day_volume"]
+                        - symbol_state.last_cumulative_volume)
         symbol_state.last_cumulative_volume = tick_data["cumulative_day_volume"]
+    else:
+        # The new cumulative volume is LOWER than the watermark we already
+        # have. Since cumulative_day_volume only ever increases over the
+        # trading day, this can only mean the tick arrived out of order
+        # (a network-delayed older packet reordered behind a newer one --
+        # common with UDP-style delivery and WebSocket reconnects).
+        #
+        # Treating this as a normal update (the old behavior: delta =
+        # max(0, new - old), then overwrite the watermark with the SMALLER
+        # value) corrupts the running watermark downward. The next
+        # in-order tick would then compute its delta against that too-low
+        # watermark, double-counting volume that was already recorded.
+        # Example (verified via simulation): watermark=1000, an
+        # out-of-order tick reports 980 (delta=0, but watermark WRONGLY
+        # drops to 980), then the next real tick reports 1010 -- computing
+        # delta = 1010-980 = 30 instead of the correct 1010-1000 = 10,
+        # a 3x volume overstatement that can spuriously inflate RVOL and
+        # trigger a false MOMENTUM alert.
+        #
+        # Fix: treat cumulative_day_volume as monotonically non-decreasing.
+        # An out-of-order/stale tick contributes zero volume and the
+        # watermark is left untouched, so it cannot corrupt future deltas.
+        delta_volume = 0
 
     symbol_state.volume_sum_last_60_seconds.add(current_timestamp, delta_volume)
     symbol_state.volume_sum_last_20_minutes.add(current_timestamp, delta_volume)
@@ -755,6 +778,14 @@ def alpha_engine():
     print("[B] shutting down (signal received)", flush=True)
     tick_subscriber.close()
     score_publisher.close()
+    # Closing individual sockets releases their file descriptors, but the
+    # underlying zmq.Context (a C++-level I/O thread pool) is separate and
+    # was never explicitly torn down. term() blocks until the context's
+    # I/O threads have shut down cleanly; without it, those threads (and
+    # any lingering socket state) could remain alive briefly after this
+    # function returns, which is wasted cleanup work for a process that's
+    # about to exit anyway but is cheap and correct to do properly.
+    zmq_context.term()
 
 
 # ============================================================
@@ -823,9 +854,11 @@ def build_exit_alert_text(symbol, tracked_position, current_score, current_last_
     the exit threshold."""
     # Prefer the direction saved at entry time (correct for every mode,
     # including GAP_FADE). Fall back to deriving it from score_at_entry
-    # only for positions created before this field existed.
+    # only for positions created before this field existed -- using
+    # .get() for score_at_entry too, so a malformed/partial Redis record
+    # degrades to a default instead of raising KeyError here.
     direction = tracked_position.get(
-        "direction", "LONG" if tracked_position["score_at_entry"] > 0 else "SHORT")
+        "direction", "LONG" if tracked_position.get("score_at_entry", 0.0) > 0 else "SHORT")
     entry_price = tracked_position.get("ltp_entry", 0)
     profit_loss_percent = (
         (current_last_traded_price - entry_price) / entry_price * 100
@@ -833,9 +866,18 @@ def build_exit_alert_text(symbol, tracked_position, current_score, current_last_
     if direction == "SHORT":
         profit_loss_percent = -profit_loss_percent
 
-    return (f"⚠️ EXIT — {symbol} ({tracked_position['mode']} {direction})\n"
+    # .get() with a default everywhere a Redis-stored dict field is read,
+    # not direct indexing -- a tracked_position dict could in principle be
+    # missing a field (e.g. it was written by an older version of this
+    # code before a field was added, or Redis data was manually edited),
+    # and a direct tracked_position['field'] access would raise KeyError
+    # and crash this exit-alert path instead of degrading gracefully.
+    mode_text = tracked_position.get("mode", "UNKNOWN")
+    score_at_entry = tracked_position.get("score_at_entry", 0.0)
+
+    return (f"⚠️ EXIT — {symbol} ({mode_text} {direction})\n"
             f"score decayed to {current_score:+.2f} "
-            f"(entry {tracked_position['score_at_entry']:+.2f})\n"
+            f"(entry {score_at_entry:+.2f})\n"
             f"ltp {current_last_traded_price:.2f} "
             f"(entry {entry_price:.2f}, delta {profit_loss_percent:+.2f}%)\n"
             f"consider closing position")
@@ -1189,7 +1231,7 @@ async def broadcaster_loop():
                         tracked_position = json.loads(tracked_position_json)
                         position_direction = tracked_position.get(
                             "direction",
-                            "LONG" if tracked_position["score_at_entry"] > 0 else "SHORT")
+                            "LONG" if tracked_position.get("score_at_entry", 0.0) > 0 else "SHORT")
                         position_mode = tracked_position.get("mode", "")
 
                         # GAP_FADE's direction is derived from the GAP's sign, not
@@ -1263,6 +1305,23 @@ async def broadcaster_loop():
                 await asyncio.sleep(0.1)   # avoid a tight error loop
     finally:
         await shutdown_telegram_bot()
+        # Explicitly close the async Redis connection pool and terminate
+        # the ZMQ context. Without this, redis.asyncio leaves its
+        # connection pool's underlying sockets open until Python's
+        # garbage collector eventually finalizes the client (which for a
+        # process that's exiting right after this point may never happen
+        # cleanly), producing a "Unclosed client session" / "Unclosed
+        # connector" warning on stderr. zmq_context.term() blocks until
+        # the context's I/O threads have shut down, mirroring the same
+        # cleanup already done in alpha_engine()'s shutdown path.
+        try:
+            await redis_client_async.aclose()
+        except Exception as redis_close_error:
+            print(f"[C] redis close err: {redis_close_error!r}", flush=True)
+        try:
+            zmq_context.term()
+        except Exception as zmq_close_error:
+            print(f"[C] zmq context term err: {zmq_close_error!r}", flush=True)
 
 
 def run_broadcaster_process():

@@ -301,6 +301,72 @@ WantedBy=multi-user.target
 
 ---
 
+## Known Limitations (by design, not bugs to silently ignore)
+
+These are architectural trade-offs, documented here so they are not mistaken for
+oversights. Each has a real cost; each was also evaluated against the cost of
+fixing it properly, and left as-is for now.
+
+- **All in-memory calculator state is lost on any Process B restart.**
+  `symbol_state_by_symbol` (every symbol's 20-minute RVOL baseline, 30-second
+  aggression window, EMA score, peak amplitude) lives only in Process B's
+  memory. A crash, a manual restart, or the scheduled JWT-refresh restart
+  (`AUTO_RESTART_HOURS`, which respawns **all three** processes together)
+  wipes it. After a restart, RVOL returns to its neutral warmup value of `1.0`
+  for the next 5 minutes (`RVOL_WARMUP_SECONDS`), and the EMA score restarts
+  from each symbol's very next tick — meaning MOMENTUM/MEAN_REVERSION/GAP_FADE
+  cannot fire on old context for a few minutes after every restart. A fix
+  would mean persisting `SymbolState` to Redis and reloading it on startup,
+  which adds real latency and complexity for a restart event that, at the
+  default `AUTO_RESTART_HOURS=20`, happens once roughly every 20 hours (i.e.
+  typically once per trading day, usually outside active hours). Not
+  implemented; noted here so it's an informed trade-off, not a surprise.
+
+- **No global Telegram rate limit.** Cooldowns are per (symbol, mode), not
+  system-wide (see "No global rate limit, by design" above). In a scenario
+  where 20-30+ symbols cross a trigger threshold within the same second (a
+  sharp, broad market-open move), `send_entry_alert` calls are issued
+  independently and could hit Telegram's own rate limits
+  (`telegram.error.RetryAfter`), silently dropping some alerts. In practice
+  this requires a genuinely unusual number of simultaneous qualifying
+  signals; the fix (a shared async semaphore + backoff/retry queue in front
+  of every `bot.send_message` call) is a reasonable future addition but adds
+  its own latency and complexity for a low-frequency event.
+
+- **`RollingWindowSum.running_sum` accumulates floating-point rounding error
+  over very long uptimes.** Every `add()` does a float `+=`/`-=`; volumes are
+  currently integers cast to float, so this is inert today, but if a future
+  calculator fed genuinely fractional values (e.g. raw price) through this
+  same class over a multi-day uptime, `running_sum` could drift to a small
+  nonzero value (like `1e-10`) even when the window is logically empty. Not
+  an issue for the current volume-only usage; worth remembering if this class
+  is reused for price/VWAP data later.
+
+- **A tick that arrives with the exact same timestamp as the previous tick
+  for that symbol contributes to `update_rolling_windows` but NOT to the EMA
+  score.** This can happen when the exchange feed delivers two updates in the
+  same millisecond (batched packets). The composite score for that
+  duplicate-timestamp tick is computed but discarded rather than blended into
+  `smoothed_ema_score` — see the `elif tick_data["timestamp"] >
+  symbol_state.last_tick_timestamp:` branch in `alpha_engine()`. In the rare
+  case where the discarded tick represented a materially different market
+  state (e.g. a large aggressive order), that specific signal is smoothed
+  away rather than acted on. A fix would need a tie-breaking sequence number
+  from the exchange feed (Angel's mode-3 payload does not reliably provide
+  one) rather than relying on wall-clock time alone.
+
+- **Mute status is cached for `MUTE_STATUS_CACHE_SECONDS` (1 second).** If the
+  user mutes via Telegram/Redis/disk-flag at the exact moment a qualifying
+  signal is being evaluated inside that 1-second cache window, the alert can
+  still go out before the mute is picked up on the next cache refresh. This
+  is a deliberate latency/Redis-load trade-off (checking Redis + disk on
+  every single incoming score message, hundreds of times per second at
+  scale, is unnecessary overhead) rather than an oversight. Worst case is a
+  roughly 1-second-late mute, which is acceptable for an advisory system
+  where the user still makes the final manual trading decision.
+
+---
+
 ## Roadmap
 
 - [x] 3-process pipeline with real Angel WebSocket integration
@@ -321,6 +387,12 @@ WantedBy=multi-user.target
 - [x] Trade-classified absorption (Lee-Ready + tick-rule fallback)
 - [x] Rolling 30-second aggression window (replaces noisy per-tick classification)
 - [x] Full descriptive naming throughout the codebase (no abbreviations)
+- [x] RVOL warmup-window inflation fix (baseline divisor uses actual elapsed minutes, not a hardcoded 19.0)
+- [x] Monotonic cumulative-volume watermark (rejects out-of-order/stale ticks instead of corrupting the delta calculation)
+- [x] FATAL config errors (missing/invalid credentials) stop the launcher instead of endlessly respawning
+- [x] Telegram HTML formatting paired with `parse_mode="HTML"` on every button-callback edit
+- [x] Defensive `.get()` access on all Redis-stored dict fields (no KeyError risk on partial/legacy records)
+- [x] Explicit ZMQ context + async Redis connection cleanup on graceful shutdown
 - [ ] TimescaleDB async logger for tick + score history
 - [ ] Scrip master disk cache with mtime-based refresh
 - [ ] Backtest harness against 3-month historical tick data

@@ -311,12 +311,18 @@ def _update_windows(st, tick):
         dvol = max(0, tick["vol"] - st.last_vol); st.last_vol = tick["vol"]
     st.vol_60.add(ts, dvol); st.vol_20m.add(ts, dvol)
 
-    # Trade classification for aggression + absorption (Y1 + Y2 shared infrastructure)
+    # Trade classification for aggression + absorption (Y1 + Y2 shared infrastructure).
+    # IMPORTANT: call .add() every tick unconditionally (even with value=0) so the
+    # window's internal eviction (the `while` loop inside WindowSum.add) runs every
+    # tick. If add() were only called when cls!=0 and dvol>0, a quiet stretch (no
+    # aggressive trades) would never evict old entries -- stale minutes-old data
+    # would keep being read by _c3_agg_buy/_c4_absorption as if it were "last 30s".
     cls = _classify(tick, st.last_ltp)
     st.last_ltp = tick["ltp"]
-    if cls != 0 and dvol > 0:
-        st.aggr_signed.add(ts, cls * dvol)
-        st.aggr_abs.add(ts, dvol)
+    signed_v = (cls * dvol) if (cls != 0 and dvol > 0) else 0.0
+    abs_v    = dvol if (cls != 0 and dvol > 0) else 0.0
+    st.aggr_signed.add(ts, signed_v)
+    st.aggr_abs.add(ts, abs_v)
 
     st.ltp_30s.append((ts, tick["ltp"]))
     cut = ts - 30
@@ -619,7 +625,35 @@ async def broadcaster_loop():
 def run_broadcaster(): asyncio.run(broadcaster_loop())
 
 
-# ---------- launcher with watchdog + graceful shutdown ----------
+# ---------- launcher: self-healing (auto-respawn) + graceful shutdown ----------
+# Derive raw filesystem paths from the ipc:// URIs so cleanup doesn't hardcode them twice.
+_IPC_PATHS = [p[len("ipc://"):] for p in (ZMQ_TICKS, ZMQ_SCORES) if p.startswith("ipc://")]
+MAX_RESTARTS_PER_WINDOW = 6        # crash-loop breaker
+RESTART_WINDOW_S        = 3600
+
+
+def _cleanup_ipc():
+    """Remove stale ZMQ ipc:// socket files. Required because UNIX domain sockets
+    are NOT auto-removed by the kernel when a process dies without closing them
+    cleanly (e.g. SIGKILL) -- the next bind() on the same path fails with
+    'Address already in use' otherwise."""
+    for path in _IPC_PATHS:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"[launcher] removed stale ipc socket: {path}", flush=True)
+        except Exception as e:
+            print(f"[launcher] ipc cleanup warn ({path}): {e!r}", flush=True)
+
+
+def _spawn_all():
+    procs = [Process(target=data_factory,    name="A-DataFactory"),
+             Process(target=alpha_engine,    name="B-AlphaEngine"),
+             Process(target=run_broadcaster, name="C-Broadcaster")]
+    for p in procs: p.start()
+    return procs
+
+
 def _shutdown(procs, reason):
     print(f"\n[launcher] shutdown: {reason}", flush=True)
     for p in procs:
@@ -630,24 +664,43 @@ def _shutdown(procs, reason):
     for p in procs:
         if p.is_alive():
             print(f"[launcher] force-kill {p.name}", flush=True); p.kill(); p.join(timeout=2)
+    _cleanup_ipc()
 
 
 if __name__ == "__main__":
-    procs = [Process(target=data_factory,    name="A-DataFactory"),
-             Process(target=alpha_engine,    name="B-AlphaEngine"),
-             Process(target=run_broadcaster, name="C-Broadcaster")]
-    for p in procs: p.start()
+    _cleanup_ipc()                          # defensive: clear sockets left by a prior ungraceful exit
+    procs = _spawn_all()
 
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
 
+    restart_times = deque()                 # crash-loop breaker: timestamps of recent restarts
+
     try:
         while not stop.is_set():
             dead = [p for p in procs if not p.is_alive()]
             if dead:
-                _shutdown(procs, f"process died: {[p.name for p in dead]} (exit={dead[0].exitcode})")
-                sys.exit(1)
+                exitcodes = {p.name: p.exitcode for p in dead}
+                planned = any(c == 2 for c in exitcodes.values())  # 2 = our AUTO_RESTART_HOURS signal
+                reason = "planned restart (JWT refresh)" if planned else f"process died: {exitcodes}"
+                _shutdown(procs, reason)
+
+                now = time.time()
+                restart_times.append(now)
+                while restart_times and now - restart_times[0] > RESTART_WINDOW_S:
+                    restart_times.popleft()
+                if len(restart_times) > MAX_RESTARTS_PER_WINDOW:
+                    print(f"[launcher] FATAL: {len(restart_times)} restarts in the last "
+                          f"{RESTART_WINDOW_S/3600:.0f}h -- crash loop suspected "
+                          f"(check credentials/.env/network). Exiting without further retry.",
+                          flush=True)
+                    sys.exit(1)
+
+                print("[launcher] respawning all processes...", flush=True)
+                time.sleep(2)                # brief pause -- avoid a tight crash loop
+                procs = _spawn_all()
+                continue
             time.sleep(1)
         _shutdown(procs, "signal received")
     except KeyboardInterrupt:

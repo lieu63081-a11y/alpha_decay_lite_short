@@ -16,9 +16,28 @@ import threading
 
 # Force IST for time.localtime() calls (fast C-level path + correct timezone
 # regardless of what timezone the server itself is configured with).
+#
+# IMPORTANT PLATFORM NOTE: time.tzset() is documented as Unix-only
+# (Python docs: "Availability: Unix"). On Windows, os.environ["TZ"]
+# alone does NOT affect time.localtime()'s output, because Windows'
+# C runtime does not consult the TZ environment variable the way Unix
+# libc does, and time.tzset() itself does not exist there. This
+# deployment targets Linux VPS only (see README/deploy docs), so this
+# is not a practical issue for actual usage -- but if this script is
+# ever run on Windows by mistake, calculate_gap_fade and
+# calculate_session_weight's time-of-day windows would silently use
+# the WRONG timezone with no error raised. The check below fails fast
+# with a clear message instead of producing silently-wrong signals.
 os.environ["TZ"] = "Asia/Kolkata"
 if hasattr(time, "tzset"):
     time.tzset()
+elif os.name != "posix":
+    print("[STARTUP] FATAL: this script requires time.tzset() (Unix-only) "
+          "for correct IST session-window calculations. Detected a "
+          "non-Unix platform (Windows?) where TZ env var alone does not "
+          "affect time.localtime(). Run this on a Linux/Unix host instead.",
+          flush=True)
+    sys.exit(1)
 
 import json
 import math
@@ -596,11 +615,52 @@ def alpha_engine():
     heartbeat_redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     start_heartbeat_thread("B", heartbeat_redis_client)   # kill switch #2
 
+    # multiprocessing.Process.terminate() sends SIGTERM to this process.
+    # Without our own handler, Python's default disposition for SIGTERM
+    # is immediate termination -- the launcher's terminate()/join() would
+    # still "work" from the launcher's point of view, but this process
+    # gets no chance to close its sockets cleanly. Registering a handler
+    # here means the process instead breaks out of its main loop and exits
+    # via a normal return, which is a cleaner shutdown.
+    stop_requested = threading.Event()
+
+    def handle_stop_signal(_signum, _frame):
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, handle_stop_signal)
+    signal.signal(signal.SIGINT, handle_stop_signal)
+
+    # A plain, unconditional recv_multipart() blocks forever if Process A
+    # stops sending ticks (market closed, WS disconnected, etc). While
+    # blocked, this loop can never reach its periodic stats-print check,
+    # so the console goes completely silent with no indication of why --
+    # it looks indistinguishable from a crash. Using a Poller with a
+    # timeout means the loop always wakes up at least once per
+    # RECEIVE_POLL_TIMEOUT_MS, whether or not a tick actually arrived, so
+    # stats keep printing (showing ticks=0) and the stop signal is checked
+    # promptly instead of only being handled after the next tick shows up.
+    RECEIVE_POLL_TIMEOUT_MS = 1000
+    poller = zmq.Poller()
+    poller.register(tick_subscriber, zmq.POLLIN)
+
     symbol_state_by_symbol: dict[str, SymbolState] = {}
     tick_count_in_window, last_stats_print_time = 0, time.time()
     print("[B] Alpha Engine up", flush=True)
 
-    while True:
+    while not stop_requested.is_set():
+        ready_sockets = dict(poller.poll(timeout=RECEIVE_POLL_TIMEOUT_MS))
+        if tick_subscriber not in ready_sockets:
+            # No tick arrived within the poll timeout. Still run the
+            # periodic stats print below so silence is visible as
+            # "ticks=0", not indistinguishable from a hang.
+            current_time = time.time()
+            if current_time - last_stats_print_time >= 10:
+                print(f"[B] ticks=0 (0/s)  syms={len(symbol_state_by_symbol)}  "
+                      f"top: -  (no ticks received in last "
+                      f"{current_time - last_stats_print_time:.0f}s)", flush=True)
+                tick_count_in_window, last_stats_print_time = 0, current_time
+            continue
+
         symbol_bytes, message_payload = tick_subscriber.recv_multipart()
         tick_data = json.loads(message_payload)
         latency_ms = (time.time() - tick_data["timestamp"]) * 1000
@@ -669,6 +729,10 @@ def alpha_engine():
             print(f"[B] ticks={tick_count_in_window} ({ticks_per_second:.0f}/s)  "
                   f"syms={len(symbol_state_by_symbol)}  top: {summary_line}", flush=True)
             tick_count_in_window, last_stats_print_time = 0, current_time
+
+    print("[B] shutting down (signal received)", flush=True)
+    tick_subscriber.close()
+    score_publisher.close()
 
 
 # ============================================================
@@ -788,6 +852,18 @@ async def initialize_telegram_bot(redis_client_async):
             mode = callback_parts[2] if len(callback_parts) > 2 else ""
             redis_client = context.application.bot_data["redis"]
 
+            # NOTE: edit_message_text() accepts a reply_markup parameter that
+            # replaces (or, when None, removes) the message's inline keyboard
+            # in the SAME API call. The previous version made two separate
+            # calls (edit_message_reply_markup then edit_message_text) for
+            # every button press -- doubling Telegram API usage for no
+            # benefit, and occasionally risking a
+            # 'Message is not modified' error between the two calls.
+            # Also using message.text_html (instead of message.text) so
+            # that if any future alert text adopts HTML formatting, a
+            # button press won't silently strip it back to plain text.
+            original_text_html = callback_query.message.text_html
+
             if action == "ACK":
                 pending_info = await redis_client.get(
                     f"alpha:pending:{callback_query.message.message_id}")
@@ -796,36 +872,36 @@ async def initialize_telegram_bot(redis_client_async):
                         f"alpha:pos:{symbol}", TRACKED_POSITION_TTL_SECONDS, pending_info)
                     await redis_client.delete(
                         f"alpha:pending:{callback_query.message.message_id}")
-                    await callback_query.edit_message_reply_markup(reply_markup=None)
                     await callback_query.edit_message_text(
-                        f"{callback_query.message.text}\n\n✅ ACK'd — tracking for exit")
+                        text=f"{original_text_html}\n\n✅ ACK'd — tracking for exit",
+                        reply_markup=None)
                 else:
-                    await callback_query.edit_message_reply_markup(reply_markup=None)
                     await callback_query.edit_message_text(
-                        f"{callback_query.message.text}\n\n"
-                        f"✅ ACK'd (details expired after 24h)")
+                        text=f"{original_text_html}\n\n"
+                             f"✅ ACK'd (details expired after 24h)",
+                        reply_markup=None)
 
             elif action == "SKIP":
                 skip_log_key = f"alpha:skip:{time.strftime('%Y%m%d')}"
                 await redis_client.lpush(skip_log_key, json.dumps(
                     {"symbol": symbol, "mode": mode, "timestamp": time.time()}))
                 await redis_client.expire(skip_log_key, 30 * 24 * 3600)
-                await callback_query.edit_message_reply_markup(reply_markup=None)
                 await callback_query.edit_message_text(
-                    f"{callback_query.message.text}\n\n⏭️ SKIPPED (logged)")
+                    text=f"{original_text_html}\n\n⏭️ SKIPPED (logged)",
+                    reply_markup=None)
 
             elif action == "DONE":
                 await redis_client.delete(f"alpha:pos:{symbol}")
-                await callback_query.edit_message_reply_markup(reply_markup=None)
                 await callback_query.edit_message_text(
-                    f"{callback_query.message.text}\n\n✔️ DONE — position closed")
+                    text=f"{original_text_html}\n\n✔️ DONE — position closed",
+                    reply_markup=None)
 
             elif action == "HOLD":
                 await redis_client.setex(
                     f"alpha:exitcd:{symbol}", EXIT_ALERT_COOLDOWN_SECONDS * 2, "1")
-                await callback_query.edit_message_reply_markup(reply_markup=None)
                 await callback_query.edit_message_text(
-                    f"{callback_query.message.text}\n\n⏳ HOLDING — exit cooldown extended")
+                    text=f"{original_text_html}\n\n⏳ HOLDING — exit cooldown extended",
+                    reply_markup=None)
         except Exception as button_error:
             print(f"[C] button handler err: {button_error!r}", flush=True)
 
@@ -968,6 +1044,9 @@ async def check_suppression_status(redis_client_async):
     return False, ""
 
 
+SCORE_RECEIVE_TIMEOUT_SECONDS = 1.0   # how often the broadcaster loop wakes up even with no data
+
+
 async def broadcaster_loop():
     """Process C's main loop. Consumes scores published by Process B,
     checks suppression (mute/heartbeats), fires exit alerts for tracked
@@ -979,6 +1058,23 @@ async def broadcaster_loop():
     score_subscriber.setsockopt(zmq.RCVHWM, ZMQ_HIGH_WATER_MARK)
     score_subscriber.setsockopt(zmq.SUBSCRIBE, b"")
     score_subscriber.connect(ZMQ_SCORES_ADDRESS)
+
+    # multiprocessing.Process.terminate() sends SIGTERM. Inside an asyncio
+    # event loop, the cleanest way to react to that is an
+    # asyncio-native signal handler that sets a stop Event, so the main
+    # while-loop below can check it and exit through the `finally` block
+    # (which shuts down the Telegram bot cleanly) instead of the process
+    # being killed mid-flight with pending Telegram/Redis I/O abandoned.
+    stop_requested = asyncio.Event()
+    running_loop = asyncio.get_running_loop()
+    try:
+        for signal_number in (signal.SIGTERM, signal.SIGINT):
+            running_loop.add_signal_handler(signal_number, stop_requested.set)
+    except NotImplementedError:
+        # add_signal_handler is unavailable on some platforms (e.g. Windows);
+        # the process will still respond to SIGKILL from the launcher's
+        # force-kill fallback, just without a clean shutdown path.
+        pass
 
     redis_client_async = redis_asyncio.from_url(
         REDIS_URL, decode_responses=True,
@@ -1000,9 +1096,31 @@ async def broadcaster_loop():
     print("[C] Broadcaster up", flush=True)
 
     try:
-        while True:
+        while not stop_requested.is_set():
             try:
-                symbol_bytes, message_payload = await score_subscriber.recv_multipart()
+                # A plain, unconditional recv_multipart() blocks forever if
+                # Process B stops publishing (market closed, engine down,
+                # etc). While blocked, this loop never reaches the periodic
+                # stats-print check below, so the console goes silent with
+                # no visible indication of "no_data" suppression -- it
+                # looks indistinguishable from a crash. Wrapping the recv in
+                # asyncio.wait_for() means the loop always wakes up at least
+                # once every SCORE_RECEIVE_TIMEOUT_SECONDS even with zero
+                # incoming messages, so stats keep printing and the stop
+                # signal is checked promptly.
+                try:
+                    symbol_bytes, message_payload = await asyncio.wait_for(
+                        score_subscriber.recv_multipart(),
+                        timeout=SCORE_RECEIVE_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    current_time = time.time()
+                    if current_time - last_stats_print_time >= 15:
+                        print(f"[C] {stats_counters} (no scores received in last "
+                              f"{current_time - last_stats_print_time:.0f}s)", flush=True)
+                        stats_counters = dict.fromkeys(stats_counters, 0)
+                        last_stats_print_time = current_time
+                    continue
+
                 score_data = json.loads(message_payload)
                 stats_counters["scores_received"] += 1
 
@@ -1041,12 +1159,31 @@ async def broadcaster_loop():
                         position_direction = tracked_position.get(
                             "direction",
                             "LONG" if tracked_position["score_at_entry"] > 0 else "SHORT")
-                        current_score = score_data["score"]
+                        position_mode = tracked_position.get("mode", "")
 
-                        if position_direction == "LONG":
-                            should_exit = current_score <= EXIT_ALERT_SCORE_THRESHOLD
+                        # GAP_FADE's direction is derived from the GAP's sign, not
+                        # the composite score's sign (see determine_entry_direction) --
+                        # the two can legitimately disagree (e.g. a bullish gap-fade
+                        # entry can coexist with a bearish composite score from the
+                        # other 8 calculators). So for GAP_FADE we must evaluate the
+                        # exit condition against gap_fade_raw_score (the same metric
+                        # that triggered entry), NOT the composite score. Using the
+                        # composite score here was a real bug: it could cause an
+                        # exit alert to fire on the very next tick after entry,
+                        # because the composite score was never actually inside the
+                        # GAP_FADE entry's trigger range to begin with.
+                        if position_mode == "GAP_FADE":
+                            current_gap_score = score_data.get("gap", 0.0)
+                            if position_direction == "LONG":
+                                should_exit = current_gap_score <= EXIT_ALERT_SCORE_THRESHOLD
+                            else:
+                                should_exit = current_gap_score >= -EXIT_ALERT_SCORE_THRESHOLD
                         else:
-                            should_exit = current_score >= -EXIT_ALERT_SCORE_THRESHOLD
+                            current_score = score_data["score"]
+                            if position_direction == "LONG":
+                                should_exit = current_score <= EXIT_ALERT_SCORE_THRESHOLD
+                            else:
+                                should_exit = current_score >= -EXIT_ALERT_SCORE_THRESHOLD
 
                         if should_exit:
                             try:

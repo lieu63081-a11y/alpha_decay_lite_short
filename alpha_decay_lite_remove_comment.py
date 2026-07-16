@@ -293,6 +293,8 @@ def data_factory():
             "daily_vwap": (market_data_message.get("average_traded_price") or 0) / 100.0,
             "total_buy_quantity": market_data_message.get("total_buy_quantity") or 0,
             "total_sell_quantity": market_data_message.get("total_sell_quantity") or 0,
+            "top5_buy_quantity":  sum((lvl.get("quantity") or 0) for lvl in best_5_buy_levels[:5]),
+            "top5_sell_quantity": sum((lvl.get("quantity") or 0) for lvl in best_5_sell_levels[:5]),
             "open_price": (market_data_message.get("open_price_of_the_day") or 0) / 100.0,
             "previous_close_price": (market_data_message.get("closed_price") or 0) / 100.0,
         }
@@ -395,12 +397,12 @@ def calculate_absorption(symbol_state, tick_data):
     return 0.0
 
 def calculate_book_imbalance(_symbol_state, tick_data):
-    total_buy_quantity = tick_data["total_buy_quantity"]
-    total_sell_quantity = tick_data["total_sell_quantity"]
-    combined_quantity = total_buy_quantity + total_sell_quantity
+    top5_buy_quantity  = tick_data["top5_buy_quantity"]
+    top5_sell_quantity = tick_data["top5_sell_quantity"]
+    combined_quantity = top5_buy_quantity + top5_sell_quantity
     if not combined_quantity:
         return 0.0
-    imbalance_ratio = (total_buy_quantity - total_sell_quantity) / combined_quantity
+    imbalance_ratio = (top5_buy_quantity - top5_sell_quantity) / combined_quantity
     return clip_value(imbalance_ratio * 2, -2.0, 2.0)
 
 def calculate_spread_ratio(_symbol_state, tick_data):

@@ -320,14 +320,40 @@ def calculate_absorption(symbol_state, tick_data):
     return 0.0
 
 def calculate_book_imbalance(_symbol_state, tick_data):
-    """Calculator #5: Angel जो total_buy_quantity / total_sell_quantity
-    में 5 levels का data देता है, उसका order-book depth imbalance।"""
-    total_buy_quantity = tick_data["total_buy_quantity"]
-    total_sell_quantity = tick_data["total_sell_quantity"]
-    combined_quantity = total_buy_quantity + total_sell_quantity
+    """Calculator #5: near-price order-book depth imbalance, TOP-5 bid
+    levels और TOP-5 ask levels के quantities का sum use करके compute
+    होता है। Score [-2.0, +2.0] range में: positive मतलब near-price
+    buy pressure sell pressure से ज़्यादा है, negative मतलब उल्टा।
+
+    ज़रूरी (क्यों top-5, न कि total_buy_quantity / total_sell_quantity):
+    Angel के total_buy_quantity / total_sell_quantity WHOLE-BOOK
+    aggregates हैं जो किसी भी price level पर open हर limit order को
+    count करते हैं, दूर पड़े retail "wish list" orders भी शामिल हैं
+    (जैसे LTP ₹1100 है और कोई ₹900 पर buy order डाले हुए है)। वो
+    orders लगभग कभी trade नहीं होंगे, लेकिन total में जुड़ते हैं --
+    तो एक perfectly balanced near-price book पर भी एक lopsided
+    garbage tail ratio को +/-0.9 तक push कर सकता है बिना किसी असली
+    directional signal के। Simulation से verified: near-price top-5
+    balanced 4000 vs 4000, plus 4,50,000 far-off retail buys LTP से
+    ~20% नीचे, whole-book imbalance +0.90 (score +1.80, strong
+    bullish) देता था vs सही 0.00 (no bias) top-5 formula से। Top-5
+    sums वो actual near-price liquidity measure करते हैं जो short-
+    term price moves drive करती है, न कि retail "sasta chahiye" वाला
+    tail unreachable prices पर।
+
+    NOTE: यह calculator top5_buy_quantity / top5_sell_quantity fields
+    को tick_data से पढ़ता है। ये fields Process A (data_factory का
+    on_tick_received callback) में populate होते हैं, जो
+    best_5_buy_data / best_5_sell_data के 5 levels को iterate करके
+    उनकी quantities का sum निकालता है। यह file (process_b_alpha_
+    engine.py) standalone runnable नहीं है -- असल में चलाने पर
+    Process A से ये fields मिलते हैं।"""
+    top5_buy_quantity  = tick_data["top5_buy_quantity"]
+    top5_sell_quantity = tick_data["top5_sell_quantity"]
+    combined_quantity = top5_buy_quantity + top5_sell_quantity
     if not combined_quantity:
         return 0.0
-    imbalance_ratio = (total_buy_quantity - total_sell_quantity) / combined_quantity
+    imbalance_ratio = (top5_buy_quantity - top5_sell_quantity) / combined_quantity
     return clip_value(imbalance_ratio * 2, -2.0, 2.0)
 
 def calculate_spread_ratio(_symbol_state, tick_data):

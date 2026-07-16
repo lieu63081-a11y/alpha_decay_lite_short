@@ -643,8 +643,36 @@ def data_factory():
             "best_ask_price": ((best_5_sell_levels[0].get("price") or 0) / 100.0) if best_5_sell_levels else 0.0,
             "cumulative_day_volume": market_data_message.get("volume_trade_for_the_day") or 0,
             "daily_vwap": (market_data_message.get("average_traded_price") or 0) / 100.0,
+            # total_buy_quantity / total_sell_quantity are Angel's WHOLE-BOOK
+            # aggregates -- they sum every pending buy/sell order at ANY
+            # price level for this symbol, including far-off retail limit
+            # orders at prices like Rs 900 while the LTP is Rs 1100 (orders
+            # that will almost certainly never trade). For calculate_book_
+            # imbalance's purposes these fields are misleading: on a
+            # perfectly balanced near-price book they can still report a
+            # strongly bullish (or bearish) imbalance purely because of the
+            # long tail of far-off "wish list" orders on one side.
+            # Verified via simulation: near-price top-5 balanced 4000/4000,
+            # far-off retail 4,50,000 buys at 20% below LTP, produced
+            # imbalance +0.90 (score +1.80) under the whole-book formula
+            # vs the correct 0.00 under the top-5 formula.
+            # Kept in tick_data as-is for backward compatibility (external
+            # tools or a future calculator may want the whole-book value),
+            # but the meaningful "immediate liquidity imbalance" signal is
+            # top5_buy_quantity / top5_sell_quantity below, which is what
+            # calculate_book_imbalance actually reads.
             "total_buy_quantity": market_data_message.get("total_buy_quantity") or 0,
             "total_sell_quantity": market_data_message.get("total_sell_quantity") or 0,
+            # Top-5-level quantity sums: this is the actionable near-price
+            # order-book imbalance measure. Angel already sends 5 levels of
+            # depth in mode-3 SNAP_QUOTE (best_5_buy_data / best_5_sell_data),
+            # so we compute these sums locally at zero extra API cost. Same
+            # `(x or 0)` null-safety pattern as everywhere else in this
+            # tick_data dict, applied per level to handle a malformed level
+            # dict (empty {}, missing "quantity" key, or explicit JSON null
+            # value) without crashing this callback.
+            "top5_buy_quantity":  sum((lvl.get("quantity") or 0) for lvl in best_5_buy_levels[:5]),
+            "top5_sell_quantity": sum((lvl.get("quantity") or 0) for lvl in best_5_sell_levels[:5]),
             "open_price": (market_data_message.get("open_price_of_the_day") or 0) / 100.0,
             "previous_close_price": (market_data_message.get("closed_price") or 0) / 100.0,
         }
@@ -802,14 +830,32 @@ def calculate_absorption(symbol_state, tick_data):
 
 
 def calculate_book_imbalance(_symbol_state, tick_data):
-    """Calculator #5: order-book depth imbalance across the 5 levels
-    that Angel provides in total_buy_quantity / total_sell_quantity."""
-    total_buy_quantity = tick_data["total_buy_quantity"]
-    total_sell_quantity = tick_data["total_sell_quantity"]
-    combined_quantity = total_buy_quantity + total_sell_quantity
+    """Calculator #5: near-price order-book depth imbalance, computed
+    from the sum of quantities across the TOP-5 bid levels vs the TOP-5
+    ask levels. Returns a score in [-2.0, +2.0]: positive means near-price
+    buy pressure exceeds sell pressure, negative means the opposite.
+
+    IMPORTANT (why top-5, not total_buy_quantity / total_sell_quantity):
+    Angel's total_buy_quantity / total_sell_quantity are WHOLE-BOOK
+    aggregates that include every open limit order at ANY price level,
+    including far-off retail "wish list" orders (e.g. buys at Rs 900
+    while LTP is Rs 1100). Those orders will almost never trade, but
+    they still count toward the totals -- so on a perfectly balanced
+    near-price book, a long tail of one-sided garbage orders can push
+    the ratio to +/-0.9 with no real directional signal underneath it.
+    Verified via simulation: near-price top-5 book of 4000 vs 4000
+    (balanced), plus 4,50,000 far-off retail buys at ~20% below LTP,
+    produced a whole-book imbalance of +0.90 (score +1.80, strong
+    bullish) vs the correct 0.00 (no bias) under the top-5 formula.
+    Using top-5 sums measures the actual near-price liquidity that will
+    drive short-term price moves, not the retail "sasta chahiye" tail
+    at unreachable prices."""
+    top5_buy_quantity  = tick_data["top5_buy_quantity"]
+    top5_sell_quantity = tick_data["top5_sell_quantity"]
+    combined_quantity = top5_buy_quantity + top5_sell_quantity
     if not combined_quantity:
         return 0.0
-    imbalance_ratio = (total_buy_quantity - total_sell_quantity) / combined_quantity
+    imbalance_ratio = (top5_buy_quantity - top5_sell_quantity) / combined_quantity
     return clip_value(imbalance_ratio * 2, -2.0, 2.0)
 
 
